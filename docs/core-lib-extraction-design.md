@@ -118,12 +118,17 @@ Systematically replace every import statement across all files. The mapping is:
 | `from adapters import ...` | `from db_adapter.adapters import ...` |
 | `from adapters.base import ...` | `from db_adapter.adapters.base import ...` |
 | `from adapters.postgres_adapter import ...` | `from db_adapter.adapters.postgres import ...` |
-| `from config import ...` | `from db_adapter.config.loader import ...` |
-| `from schema.models import ...` | `from db_adapter.schema.models import ...` or `from db_adapter.config.models import ...` |
+| `from config import load_db_config` | `from db_adapter.config.loader import load_db_config` |
+| `from config import get_settings` | REMOVE (MC-specific, depends on `creational.common.config.SharedSettings`) |
+| `from schema.models import DatabaseProfile, DatabaseConfig` | `from db_adapter.config.models import DatabaseProfile, DatabaseConfig` |
+| `from schema.models import ConnectionResult` | `from db_adapter.schema.models import ConnectionResult` (validation/connection result model) |
+| `from schema.models import ColumnSchema, TableSchema, ...` | `from db_adapter.schema.models import ...` (introspection/validation models) |
 | `from schema.comparator import ...` | `from db_adapter.schema.comparator import ...` |
 | `from schema.introspector import ...` | `from db_adapter.schema.introspector import ...` |
+| `from schema.fix import ...` | `from db_adapter.schema.fix import ...` |
+| `from schema.sync import ...` | `from db_adapter.schema.sync import ...` |
 | `from schema.db_models import ...` | REMOVE (MC-specific) |
-| `from db import ...` | `from db_adapter.factory import ...` |
+| `from db import ...` | `from db_adapter.factory import ...` (covers `get_db_adapter`, `connect_and_validate`, `read_profile_lock`, `_resolve_url`, `get_active_profile_name`, `ProfileNotFoundError`, etc.) |
 | `from backup.backup_restore import ...` | `from db_adapter.backup.backup_restore import ...` |
 
 Files to modify: every `.py` file under `src/db_adapter/`.
@@ -166,15 +171,35 @@ Add:
 - `database_url` parameter for direct mode: `get_adapter(database_url="postgresql://...")`
 - Profile lock file path relative to CWD (not `Path(__file__).parent`)
 
-Pattern for configurable env prefix:
+**Adapter lifecycle**: Remove the module-level `_adapter` global cache. The library does not manage adapter lifecycle -- callers create adapters and are responsible for calling `await adapter.close()`. `get_adapter()` is a factory function that returns a new adapter each time. For connection reuse, callers cache the adapter instance themselves.
+
+Pattern for `connect_and_validate()`:
+```python
+async def connect_and_validate(
+    profile_name: str | None = None,
+    expected_columns: dict[str, set[str]] | None = None,
+    env_prefix: str = "",
+    validate_only: bool = False,
+) -> ConnectionResult:
+    ...
+```
+
+When `expected_columns` is None, schema validation is skipped (connection-only mode). When provided, `validate_schema(actual, expected_columns)` is called.
+
+Pattern for `get_adapter()`:
 ```python
 async def get_adapter(
+    profile_name: str | None = None,
     env_prefix: str = "",
     database_url: str | None = None,
     jsonb_columns: list[str] | None = None,
 ) -> DatabaseClient:
     ...
 ```
+
+`jsonb_columns` is accepted as `list[str]` for caller convenience and converted to `frozenset` internally when passed to the adapter constructor.
+
+`get_adapter()` does NOT perform schema validation. Callers who want validation call `connect_and_validate()` first, then `get_adapter()` separately. The intended workflow is: `connect_and_validate()` writes the profile lock file on success; `get_adapter()` reads it via `profile_name` or the lock file. Callers can also pass `profile_name` directly to `get_adapter()` to reuse a validated profile without relying on the lock file, or pass `database_url` for direct connection mode.
 
 Validation: `factory.py` has zero imports from `fastmcp`, `mcp`, or `creational`.
 
@@ -189,8 +214,10 @@ Validation: `factory.py` has zero imports from `fastmcp`, `mcp`, or `creational`
 **Approach**:
 
 Remove from `config/loader.py`:
+- `from functools import lru_cache` (used only by `@lru_cache` on `get_settings()`)
 - `from pydantic import AliasChoices, Field`
 - `from creational.common.config import SharedSettings`
+- `from schema.models import DatabaseConfig, DatabaseProfile` (bare import, replaced below)
 - `Settings(SharedSettings)` class entirely
 - `get_settings()` function entirely
 
@@ -228,7 +255,7 @@ Split models by domain:
 - `ColumnSchema`, `ConstraintSchema`, `IndexSchema`, `TriggerSchema`, `FunctionSchema`
 - `TableSchema`, `DatabaseSchema`
 - `ColumnDiff`, `SchemaValidationResult`
-- `ConnectionResult`
+- `ConnectionResult` (placed here because it references `SchemaValidationResult` and is part of the schema validation flow, even though it is consumed by the factory layer)
 
 Update all imports across the codebase to point to the canonical location. The `__init__.py` files for each subpackage should re-export their public models.
 
@@ -245,13 +272,13 @@ Validation: No class is defined in more than one file. `grep -r "class DatabaseP
 **Approach**:
 
 **`adapters/base.py` -- `DatabaseClient` Protocol**:
-All methods become `async def`:
+All methods become `async def`. Type annotations and defaults preserved for structural typing compatibility:
 ```python
 class DatabaseClient(Protocol):
-    async def select(self, table, columns, filters, order_by) -> list[dict]: ...
-    async def insert(self, table, data) -> dict: ...
-    async def update(self, table, data, filters) -> dict: ...
-    async def delete(self, table, filters) -> None: ...
+    async def select(self, table: str, columns: str, filters: dict[str, Any] | None = None, order_by: str | None = None) -> list[dict]: ...
+    async def insert(self, table: str, data: dict) -> dict: ...
+    async def update(self, table: str, data: dict, filters: dict[str, Any]) -> dict: ...
+    async def delete(self, table: str, filters: dict[str, Any]) -> None: ...
     async def close(self) -> None: ...
 ```
 
@@ -272,7 +299,8 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 
 class AsyncPostgresAdapter:
     def __init__(self, database_url: str, jsonb_columns: list[str] | None = None, **engine_kwargs):
-        async_url = database_url.replace("postgresql://", "postgresql+asyncpg://")
+        # Use prefix matching (not global replace) to handle postgres:// alias
+        async_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
         self._engine: AsyncEngine = create_async_engine_pooled(async_url, **engine_kwargs)
         self._jsonb_columns = frozenset(jsonb_columns or [])
 
@@ -284,23 +312,25 @@ class AsyncPostgresAdapter:
 
 **`adapters/supabase.py` -- `AsyncSupabaseAdapter`**:
 - Rename class from `SupabaseAdapter` to `AsyncSupabaseAdapter`
-- Replace `supabase.Client` / `create_client` with `supabase._async.client.AsyncClient` / `create_async_client`
-- Use lazy initialization pattern since `create_async_client` is async (cannot call in `__init__`)
+- Replace `supabase.Client` / `create_client` with `supabase.acreate_client` (public async API)
+- Use lazy initialization pattern since `acreate_client` is async (cannot call in `__init__`). Use `asyncio.Lock` to serialize concurrent first-call initialization.
 - All methods become `async def`
 
 Pattern:
 ```python
-from supabase._async.client import AsyncClient, create_async_client
+from supabase import acreate_client, AsyncClient
 
 class AsyncSupabaseAdapter:
     def __init__(self, url: str, key: str):
         self._url = url
         self._key = key
         self._client: AsyncClient | None = None
+        self._lock = asyncio.Lock()
 
     async def _get_client(self) -> AsyncClient:
-        if self._client is None:
-            self._client = await create_async_client(self._url, self._key)
+        async with self._lock:
+            if self._client is None:
+                self._client = await acreate_client(self._url, self._key)
         return self._client
 ```
 
@@ -308,6 +338,12 @@ class AsyncSupabaseAdapter:
 ```python
 from db_adapter.adapters.base import DatabaseClient
 from db_adapter.adapters.postgres import AsyncPostgresAdapter
+
+# Optional: only available when supabase extra is installed
+try:
+    from db_adapter.adapters.supabase import AsyncSupabaseAdapter
+except ImportError:
+    pass
 ```
 
 Validation: All adapter methods are `async def`. `create_engine` does not appear anywhere. `asyncpg` is used as the SQLAlchemy driver.
@@ -324,8 +360,8 @@ Validation: All adapter methods are `async def`. `create_engine` does not appear
 
 - Replace `psycopg.connect()` with `await psycopg.AsyncConnection.connect()`
 - Replace `__enter__`/`__exit__` with `__aenter__`/`__aexit__`
-- Replace `self._conn.cursor()` context managers with async cursor usage
-- All query methods (`introspect`, `get_column_names`, `_get_tables`, `_get_columns`, etc.) become `async def`
+- Replace `self._conn.cursor()` context managers with async cursor usage: `async with self._conn.cursor() as cur: await cur.execute(...); rows = await cur.fetchall()`
+- All query methods become `async def`: `introspect`, `get_column_names`, `_get_tables`, `_get_columns`, `_get_constraints`, `_get_indexes`, `_get_triggers`, `_get_functions`. Note: `_normalize_data_type` remains sync (pure logic, no I/O).
 - `EXCLUDED_TABLES` becomes a configurable constructor parameter with sensible defaults
 
 Pattern:
@@ -336,15 +372,11 @@ class SchemaIntrospector:
     EXCLUDED_TABLES_DEFAULT = {"schema_migrations", "pg_stat_statements", "spatial_ref_sys"}
 
     def __init__(self, database_url: str, excluded_tables: set[str] | None = None):
-        self._database_url = database_url
         self._excluded_tables = excluded_tables if excluded_tables is not None else self.EXCLUDED_TABLES_DEFAULT
         self._conn: psycopg.AsyncConnection | None = None
+        ...
 
     async def __aenter__(self) -> "SchemaIntrospector":
-        url = self._database_url
-        if "connect_timeout" not in url:
-            separator = "&" if "?" in url else "?"
-            url = f"{url}{separator}connect_timeout=10"
         self._conn = await psycopg.AsyncConnection.connect(url)
         return self
 
@@ -352,9 +384,6 @@ class SchemaIntrospector:
         if self._conn:
             await self._conn.close()
             self._conn = None
-
-    async def introspect(self, schema_name: str = "public") -> DatabaseSchema: ...
-    async def get_column_names(self, schema_name: str = "public") -> dict[str, set[str]]: ...
 ```
 
 Validation: No sync `psycopg.connect()` calls remain. `__enter__`/`__exit__` replaced with async equivalents.
@@ -401,17 +430,22 @@ Validation: `comparator.py` has zero imports from `schema.db_models`. Function a
 
 Remove:
 - `COLUMN_DEFINITIONS` dict entirely
-- `from db import connect_and_validate, read_profile_lock` (MC-coupled factory imports)
+- `from db import connect_and_validate, read_profile_lock` (MC-coupled factory imports in `generate_fix_plan()`)
+- `from db import _resolve_url, connect_and_validate, read_profile_lock` (MC-coupled factory imports in `apply_fixes()`)
+- `from adapters import PostgresAdapter` (both the TYPE_CHECKING import at module top and runtime import in `apply_fixes()`)
+- `from backup.backup_restore import backup_database` (MC-coupled import in `apply_fixes()`)
+- `from backup.backup_restore import restore_database` (MC-coupled import in `apply_fixes()` for post-DROP+CREATE data restoration)
+- `from config import load_db_config` (MC-coupled import in `apply_fixes()`)
 
 Modify:
 - `generate_fix_plan()` signature to accept `column_definitions: dict[str, str]` parameter and `schema_file: str | Path`
-- `apply_fixes()` to accept same parameters, convert to async
-- `_get_table_create_sql()` uses caller-provided `schema_file` path (no default path)
-- `ColumnFix`, `TableFix`, `FixPlan`, `FixResult` dataclasses remain as-is (they are generic)
+- `apply_fixes()` to accept caller-provided adapter and parameters, convert to async
+- `_get_table_create_sql(schema_file: str | Path)` -- `schema_file` parameter becomes required (no `None` default), enforcing "no default path"
+- `ColumnFix`, `TableFix`, `FixPlan` dataclasses and `FixResult` Pydantic model remain as-is, except: remove `profile_name: str` from `FixPlan` and `FixResult` (caller context, not generated by `generate_fix_plan()`). Add `drop_order: list[str]` and `create_order: list[str]` fields to `FixPlan` for FK-aware table ordering during DROP+CREATE operations.
 
-Pattern:
+Pattern for `generate_fix_plan()`:
 ```python
-async def generate_fix_plan(
+def generate_fix_plan(
     validation_result: SchemaValidationResult,
     column_definitions: dict[str, str],
     schema_file: str | Path,
@@ -419,9 +453,25 @@ async def generate_fix_plan(
     ...
 ```
 
-The function no longer calls `connect_and_validate()` internally -- the caller passes in the `SchemaValidationResult` they already obtained.
+Pattern for `apply_fixes()`:
+```python
+async def apply_fixes(
+    adapter: DatabaseClient,
+    plan: FixPlan,
+    backup_fn: Callable | None = None,
+    restore_fn: Callable | None = None,
+    verify_fn: Callable | None = None,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> FixResult:
+    ...
+```
 
-Validation: No `COLUMN_DEFINITIONS` dict in source. No `from db import ...` in fix.py.
+`generate_fix_plan()` stays sync (pure logic). `apply_fixes()` becomes async -- it accepts a caller-provided adapter for executing SQL, an optional `backup_fn` callback for pre-fix backup, an optional `restore_fn` callback for post-DROP+CREATE data restoration (prevents data loss on table recreation), and an optional `verify_fn` callback for post-fix schema validation. The `dry_run` and `confirm` safety parameters are retained from the current API. The function no longer loads config, resolves URLs, or creates adapters internally.
+
+**Note on DDL execution**: The `DatabaseClient` Protocol only has CRUD methods (`select`/`insert`/`update`/`delete`/`close`), not raw SQL execution. For DDL operations (ALTER, DROP, CREATE), `apply_fixes()` will need the adapter's underlying engine/connection. The implementation should either add an `execute(sql: str)` method to the Protocol, or accept a separate `engine` parameter for DDL. This decision is deferred to the planning stage.
+
+Validation: No `COLUMN_DEFINITIONS` dict in source. No `from db import ...` or `from adapters import PostgresAdapter` in fix.py.
 
 ---
 
@@ -445,23 +495,45 @@ class SyncResult(BaseModel):
     error: str | None = None
 ```
 
-Functions accept a `tables` parameter:
+Functions accept `tables` and `user_id` parameters:
 ```python
 async def compare_profiles(
     source_profile: str,
     dest_profile: str,
     tables: list[str],
+    user_id: str,
     user_field: str = "user_id",
     slug_field: str = "slug",
     env_prefix: str = "",
 ) -> SyncResult:
 ```
 
+```python
+async def sync_data(
+    source_profile: str,
+    dest_profile: str,
+    tables: list[str],
+    user_id: str,
+    user_field: str = "user_id",
+    slug_field: str = "slug",
+    env_prefix: str = "",
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> SyncResult:
+```
+
+`sync_data()` replaces the current subprocess-based approach with direct calls to the async `backup_database()` / `restore_database()` functions from the backup module, using a temp file for the intermediate backup.
+
 Remove:
 - `from db import _resolve_url, get_dev_user_id` -- user_id becomes a parameter
+- `from adapters import PostgresAdapter` (TYPE_CHECKING import)
 - `_get_data_counts()` hardcoded table list -- iterate `tables` parameter
-- `_get_slugs()` hardcoded project/milestone/task logic -- use generic slug resolution
+- `_get_slugs()` hardcoded project/milestone/task logic -- use generic flat slug resolution
 - `sync_data()` subprocess calls referencing `backup/backup_cli.py` path
+
+**Internal adapter creation**: Functions resolve profile names to adapters internally by importing `load_db_config` from `db_adapter.config.loader` and `_resolve_url` from `db_adapter.factory`, then creating `AsyncPostgresAdapter` instances for each profile's resolved URL.
+
+**Generic slug resolution**: Use flat slugs only (each table's `slug_field` value as-is). Callers are responsible for ensuring slugs are unique within a table for the given user. The current MC-specific hierarchical slug composition (`project_slug/milestone_slug`) is not supported generically -- MC will handle that in its own wrapper if needed. This keeps the library simple.
 
 Validation: No hardcoded `"projects"`, `"milestones"`, or `"tasks"` string literals in sync.py.
 
@@ -484,6 +556,7 @@ async def backup_database(
     user_id: str,
     output_path: str | None = None,
     table_filters: dict[str, dict] | None = None,
+    metadata: dict | None = None,
 ) -> str:
     ...
 
@@ -504,7 +577,9 @@ Key changes:
 - Use `TableDef.parent` and `TableDef.optional_refs` for FK remapping instead of hardcoded `project_id_map`, `milestone_id_map`
 - Build generic `id_maps: dict[str, dict]` keyed by table name
 - Remove `from db import get_db_adapter, get_dev_user_id` and `from config import get_settings`
-- `validate_backup()` becomes schema-aware (checks for table keys matching `BackupSchema.tables`)
+- `validate_backup()` becomes schema-aware. Updated signature: `validate_backup(backup_path: str, schema: BackupSchema) -> dict`. Checks for table keys matching `BackupSchema.tables`.
+- `table_filters` is an optional dict keyed by table name, where each value is a filter dict passed to `adapter.select()`. This generalizes the current `project_slugs` parameter -- e.g., `{"projects": {"slug": "my-project"}}` to backup only one project. When None, all records for the user are backed up.
+- Backup metadata no longer **writes** `db_provider` (was MC-specific from `get_settings().db_provider`). An optional `metadata: dict | None` parameter allows callers to inject custom metadata fields if needed. For read-compatibility, `validate_backup()` treats `db_provider` as optional when reading existing v1.1 backups -- it does not fail if the field is absent or present.
 
 The `BackupSchema` ordering (parents first) ensures restore processes tables in dependency order.
 
@@ -525,17 +600,18 @@ Validation: No hardcoded table names. `backup_restore.py` has zero MC-specific i
 - Change description from "Mission Control" to generic
 - Update all `cmd_*` functions to call async functions via `asyncio.run()`
 - Remove MC-specific imports and functions
-- Add `backup`, `restore`, `validate-backup` subcommands (merge from `cli/backup.py`)
 - Accept `--env-prefix` global option
 
-**`cli/backup.py`** -- will be merged into `cli/__init__.py` or kept as a submodule but using the generic `backup_restore` functions with a caller-provided schema.
+Since the CLI cannot know the caller's `BackupSchema` at runtime, backup/restore commands are deferred to consuming projects for initial release. The `db-adapter` CLI handles connect/status/profiles/validate/fix/sync. Consuming projects provide their own thin CLI wrapper that passes in `BackupSchema`. Backup commands may be added to the library CLI in a future version if a standard schema definition file format is adopted (see Open Question #2).
 
-Since the CLI cannot know the caller's `BackupSchema` at runtime, the CLI will need a way to load schema definitions. Two options:
+**`cli/backup.py`** -- kept as a separate submodule for now, not registered from `cli/__init__.py` until backup CLI is supported. Contains backup/restore/validate-backup subcommands using the generic `backup_restore` functions; will be wired in when a schema definition file format is adopted.
 
-**Option A**: CLI reads a `db-backup.toml` or section in `db.toml` that declares the table hierarchy.
-**Option B**: CLI provides basic operations and consumers wrap it.
-
-For initial release, Option B is simpler -- the CLI handles connect/status/profiles/validate/fix/sync. Backup commands require the consuming project to provide a thin wrapper script that passes in `BackupSchema`. The CLI can still include `backup` and `restore` commands that accept a `--schema` flag pointing to a TOML/JSON schema definition file.
+**MC-specific CLI cleanup**: In addition to the above, these MC-specific elements in `cli/__init__.py` must be removed or generalized:
+- `_show_profile_comparison()` and `_show_profile_data()` iterate hardcoded `["projects", "milestones", "tasks"]` -- generalize to accept a table list parameter or remove data-count display
+- `cmd_fix()` contains `fk_drop_order`/`fk_create_order` dicts hardcoded with MC table names -- remove and delegate FK-aware ordering entirely to `apply_fixes()`, which reads `FixPlan.drop_order`/`FixPlan.create_order` (added in item #8)
+- `cmd_sync()` iterates hardcoded `["projects", "milestones", "tasks"]` at line 348 -- generalize to accept a table list parameter from CLI args
+- `from schema.fix import COLUMN_DEFINITIONS` import -- remove (COLUMN_DEFINITIONS no longer exists after item #8)
+- All user-facing `MC_DB_PROFILE` references in hint/help text (lines 222, 323, 414) and docstring (line 47) -- update to use the configured env prefix (or default `DB_PROFILE`)
 
 Pattern for async CLI wrapping:
 ```python
@@ -561,10 +637,6 @@ Validation: `"Mission Control"` does not appear in CLI code. `db-adapter` is the
 
 ```python
 # src/db_adapter/__init__.py
-"""db-adapter: Async dict-based database adapter with Protocol typing."""
-
-__version__ = "0.1.0"
-
 from db_adapter.adapters.base import DatabaseClient
 from db_adapter.adapters.postgres import AsyncPostgresAdapter
 from db_adapter.factory import get_adapter, connect_and_validate, ProfileNotFoundError
@@ -572,21 +644,14 @@ from db_adapter.config.loader import load_db_config
 from db_adapter.config.models import DatabaseProfile, DatabaseConfig
 from db_adapter.schema.comparator import validate_schema
 from db_adapter.backup.models import BackupSchema, TableDef, ForeignKey
+# ... plus __all__ with all above symbols
 
-__all__ = [
-    "DatabaseClient",
-    "AsyncPostgresAdapter",
-    "get_adapter",
-    "connect_and_validate",
-    "ProfileNotFoundError",
-    "load_db_config",
-    "DatabaseProfile",
-    "DatabaseConfig",
-    "validate_schema",
-    "BackupSchema",
-    "TableDef",
-    "ForeignKey",
-]
+# Optional: only available when supabase extra is installed
+try:
+    from db_adapter.adapters.supabase import AsyncSupabaseAdapter
+    __all__.append("AsyncSupabaseAdapter")
+except ImportError:
+    pass
 ```
 
 Subpackage `__init__.py` files should also export their public APIs.
@@ -599,7 +664,7 @@ Validation: `from db_adapter import AsyncPostgresAdapter, DatabaseClient, get_ad
 
 > Shows dependencies and recommended order. Planning stage will create actual implementation steps.
 
-**Order**: #4 -> #1 -> #3 -> #2 -> #7 -> #5 -> #6 -> #8 -> #9 -> #10 -> #11 -> #12
+**Order**: #4 -> #1 -> #3 -> #2 -> #7 -> #5 -> #6 -> #8 -> #10 -> #9 -> #11 -> #12
 
 ### #4: Consolidate Duplicate Models
 
@@ -667,19 +732,19 @@ Validation: `from db_adapter import AsyncPostgresAdapter, DatabaseClient, get_ad
 
 ---
 
-### #9: Generalize Sync Module
-
-**Depends On**: #1, #2, #5
-
-**Rationale**: Sync module creates adapters (now async), uses factory's `_resolve_url()` (cleaned in #2), and queries tables. Must be done after adapter async conversion.
-
----
-
 ### #10: Generalize Backup/Restore
 
 **Depends On**: #1, #5
 
-**Rationale**: Backup/restore uses adapters for all DB operations. With async adapters in place and the `BackupSchema` model already defined (no work needed there), this is a rewrite of the backup functions to use the declarative schema model instead of hardcoded tables.
+**Rationale**: Backup/restore uses adapters for all DB operations. With async adapters in place and the `BackupSchema` model already defined (no work needed there), this is a rewrite of the backup functions to use the declarative schema model instead of hardcoded tables. Must be done before #9 because `sync_data()` calls `backup_database()`/`restore_database()` directly.
+
+---
+
+### #9: Generalize Sync Module
+
+**Depends On**: #1, #2, #5, #10
+
+**Rationale**: Sync module creates adapters (now async), uses factory's `_resolve_url()` (cleaned in #2), and queries tables. `sync_data()` calls `backup_database()`/`restore_database()` from the backup module (generalized in #10), so #10 must be complete first.
 
 ---
 

@@ -78,3 +78,18 @@ The extraction plan calls for converting all adapters and schema tools to async:
 - `SchemaIntrospector` → async context manager with `psycopg.AsyncConnection`
 - CLI commands wrap async with `asyncio.run()`
 - `JSONB_COLUMNS` becomes a constructor parameter instead of class-level constant
+
+---
+
+## Mission Control Integration
+
+**This project is tracked in Mission Control portfolio system.**
+
+When using Mission Control MCP tools (`mcp__mission-control__*`) to manage tasks, milestones, or project status, you are acting as the **PM (Project Manager) role**. Read these docs to understand the workflow, timestamp conventions, and scope:
+
+- **Slug:** `db-adapter`
+- **Role:** PM (Project Manager)
+- **Read 1st:** `get_guide(name="PM_GUIDE")` - Project-level tactical execution
+- **Read 2nd:** `get_guide(name="MCP_TOOLS_REFERENCE")` - Complete tool parameters
+
+---
