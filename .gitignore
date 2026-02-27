@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+.env
+.db-profile
+db.toml
+*.lock
+!uv.lock
+.pytest_cache/
+.mypy_cache/
