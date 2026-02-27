@@ -20,10 +20,10 @@ Requires Python 3.12+.
 
 ```bash
 # From source
-uv add git+ssh://git@github.com:creational-ai/db-adapter.git
+uv add git+ssh://git@github.com/docchang/db-adapter.git
 
 # With Supabase support
-uv add "db-adapter[supabase] @ git+ssh://git@github.com:creational-ai/db-adapter.git"
+uv add "db-adapter[supabase] @ git+ssh://git@github.com/docchang/db-adapter.git"
 ```
 
 ## Quick Start
