@@ -115,6 +115,12 @@ collected 0 items -- no tests ran (expected baseline)
 - The `config/models.py` and `schema/models.py` files are byte-identical (12 Pydantic model classes each). Step 1 will consolidate them by domain: config models stay in `config/models.py`, introspection/validation models stay in `schema/models.py`.
 - `tests/` directory existed but was empty (no `__init__.py`). Created the marker file for proper test package structure.
 
+**Review**: PASS
+**Reviewed**: 2026-02-27T22:30:44-0800
+- **Intent match**: All three acceptance criteria met -- dependencies installed (uv.lock created), model duplication confirmed via diff (MD5 hashes match), and tests/__init__.py marker created.
+- **Assumption audit**: No assumptions introduced; purely mechanical environment verification with no interpretive decisions.
+- **Architectural drift**: Only artifact is an empty tests/__init__.py, consistent with the plan's test directory structure and standard Python package conventions.
+
 **Result**: Environment ready. Dependencies installed and verified. Model duplication confirmed. Ready for Step 1 (Consolidate Duplicate Models).
 
 ---
@@ -149,6 +155,12 @@ tests/test_lib_extraction_models.py::TestSchemaModels (14 tests) - PASSED
 - The two files were byte-for-byte identical, making the split clean with no merge conflicts.
 - AST-based inspection in tests is more reliable than grep for verifying class placement since it avoids false positives from comments or string literals.
 - Using both AST inspection and subprocess grep provides defense-in-depth: AST for structural correctness, grep for codebase-wide uniqueness.
+
+**Review**: PASS
+**Reviewed**: 2026-02-27T22:31:05-0800
+- **Intent match**: All 5 acceptance criteria met; config/models.py has exactly 2 classes, schema/models.py has exactly 10, grep uniqueness holds, and model instantiation tests pass.
+- **Assumption audit**: No undocumented assumptions; the ConnectionResult.schema_valid default changed from `bool = False` to `bool | None = None` which is a minor field-level improvement beyond the step scope but reasonable and non-breaking.
+- **Architectural drift**: File structure and class placement match the plan's Architecture section exactly; __init__.py re-exports align with the design's prescribed pattern.
 
 **Result**: Step 1 complete. Both model files now contain only their domain-specific classes with zero overlap. Ready for Step 2 (Fix Package Imports).
 
@@ -230,6 +242,12 @@ tests/test_lib_extraction_config.py::TestLoaderModuleAttributes (2 tests) - PASS
 - Changing the default path from `Path(__file__).parent` to `Path.cwd()` is essential for library semantics: a library should read config from the consumer's working directory, not from inside its own installed package.
 - The `config/__init__.py` re-export pattern (`from .loader import load_db_config`) provides a clean public API (`from db_adapter.config import load_db_config`) while keeping implementation in `loader.py`.
 
+**Review**: PASS
+**Reviewed**: 2026-02-27T22:31:15-0800
+- **Intent match**: PASS -- All 6 acceptance criteria satisfied; loader.py contains only tomllib, Path, and db_adapter.config.models imports, load_db_config() defaults to Path.cwd(), and config/__init__.py re-exports the public API.
+- **Assumption audit**: PASS -- No assumptions introduced beyond design and plan; TOML parsing, FileNotFoundError handling, and Path.cwd() default are all explicitly specified.
+- **Architectural drift**: PASS -- File structure matches plan architecture exactly (loader.py for logic, models.py for types, __init__.py for re-exports) with proper db_adapter.* import paths.
+
 **Result**: Step 3 complete. Config loader is now a clean, generic TOML loader with zero MC-specific code. Ready for Step 4 (Remove MC-Specific Code from Factory).
 
 ---
@@ -281,6 +299,12 @@ tests/test_lib_extraction_factory.py::TestFunctionSignatures (10 tests) - PASSED
 - Changing a Pydantic model field type (`schema_valid: bool` to `bool | None`) is safe because `None` was not a valid value before, so no existing code was passing `None`. The change is additive.
 - Mocking `PostgresAdapter.__init__` is the correct approach for unit testing factory logic without a database driver. The factory's job is to resolve profiles and create adapters -- testing the adapter itself is a separate concern.
 
+**Review**: PASS
+**Reviewed**: 2026-02-27T22:31:42-0800
+- **Intent match**: PASS -- All 7 acceptance criteria met; MC-specific code removed, env_prefix parameterized, connection-only mode with expected_columns=None works, resolve_url is public, and factory functions kept sync (later converted async in Step 8 as planned).
+- **Assumption audit**: PASS -- The ConnectionResult.schema_valid type change from bool to bool|None is documented in Deviation from Plan and is a justified enhancement to distinguish "not validated" from "validation failed."
+- **Architectural drift**: PASS -- File location, import paths, kept/removed function roster, and _PROFILE_LOCK_FILE using Path.cwd() all match the plan specification exactly.
+
 **Result**: Step 4 complete. Factory is now a clean, generic module with zero MC-specific code, configurable env prefix, and connection-only mode. Ready for Step 5 (Decouple Schema Comparator).
 
 ---
@@ -323,6 +347,12 @@ tests/test_lib_extraction_comparator.py::TestFactoryCallSite (2 tests) - PASSED
 - The function body was trivially implementable because the original code was already pure set logic -- only the source of `expected_columns` changed (from internal `get_all_expected_columns()` call to caller-provided parameter). This validates the design principle of separating "where data comes from" from "how data is processed."
 - Sorting all output lists (missing_tables, extra_tables, missing columns per table) makes tests deterministic and makes the `format_report()` output consistent regardless of Python set iteration order.
 - Testing the factory call site with AST inspection (checking argument count on `validate_schema()` calls) is more robust than string matching since it catches the actual call structure, not just text patterns.
+
+**Review**: PASS
+**Reviewed**: 2026-02-27T22:31:07-0800
+- **Intent match**: PASS -- All 7 acceptance criteria met; validate_schema() accepts 2 params with correct types, comparator has zero db_models imports, factory call site updated with None guard before validate_schema() call.
+- **Assumption audit**: PASS -- No assumptions beyond design; sorting output lists for determinism is a reasonable implementation choice that does not alter the contract.
+- **Architectural drift**: PASS -- File remains at schema/comparator.py, function stays sync (pure logic, no IO), uses proper db_adapter.schema.models import path, and factory integration matches design intent.
 
 **Result**: Step 5 complete. Schema comparator is now fully decoupled from MC -- accepts caller-provided expected_columns with zero external dependencies. Ready for Step 6 (Convert Adapters to Async).
 
@@ -376,6 +406,12 @@ tests/test_lib_extraction_adapters.py::TestCreateAsyncEnginePooled (5 tests) - P
   - **Why this approach:** Clean break is simpler. Aliases create confusion about which name is canonical. Downstream modules (`fix.py`, `sync.py`, `cli/`) are still sync and will be converted in later steps anyway.
   - **Risk accepted:** If any external consumer references `PostgresAdapter` by name, it will break. Since there are no external consumers yet (greenfield extraction), this is acceptable.
 
+
+**Review**: PASS
+**Reviewed**: 2026-02-27T22:27:23-0800
+- **Intent match**: All 8 acceptance criteria verified -- async Protocol, renamed classes, JSONB constructor param, async engine imports, async context managers, and tests passing.
+- **Assumption audit**: Downstream module updates (fix.py, sync.py, cli/) were necessary to keep imports working and were documented as a deviation; no hidden assumptions introduced.
+- **Architectural drift**: File locations, Protocol typing pattern, conditional Supabase import, and db_adapter.* import paths all match the design doc target structure.
 **Lessons Learned**:
 - URL normalization requires two-step conversion: first handle the `postgres://` alias (used by Heroku, Railway, Supabase), then convert `postgresql://` to `postgresql+asyncpg://`. Using prefix matching (not global replace) prevents double-prefixing when the URL already has the async driver prefix.
 - Python 3.14 removed the implicit event loop creation in `asyncio.get_event_loop()` -- use `asyncio.run()` for one-shot async calls in tests.
@@ -430,6 +466,12 @@ tests/test_lib_extraction_introspector.py::TestSourceStructure (3 tests) - PASSE
 - Promoting `connect_timeout` from a URL string appendage to an explicit constructor parameter is cleaner -- `psycopg.AsyncConnection.connect()` accepts `connect_timeout` as a kwarg natively, eliminating URL parsing edge cases (e.g., whether `?` or `&` separator is needed).
 - String-based assertions on source code (e.g., `"self.EXCLUDED_TABLES" not in source`) are fragile when similar names exist (`EXCLUDED_TABLES_DEFAULT`). AST inspection with exact attribute matching is more robust.
 
+**Review**: PASS
+**Reviewed**: 2026-02-27T22:31:19-0800
+- **Intent match**: Pass -- All 7 plan acceptance criteria satisfied: sync patterns removed, async patterns present, AsyncConnection used, all 9 query methods are async def, _normalize_data_type stays sync, EXCLUDED_TABLES is a configurable constructor parameter with default, and 43 tests pass.
+- **Assumption audit**: Pass -- No assumptions introduced beyond the design and plan; connect_timeout default of 10 and EXCLUDED_TABLES_DEFAULT contents match the plan specification exactly.
+- **Architectural drift**: Pass -- File stays at src/db_adapter/schema/introspector.py, imports use proper db_adapter.schema.models package paths, and the psycopg AsyncConnection pattern matches the design doc's code example.
+
 **Result**: Step 7 complete. SchemaIntrospector is fully async: uses `psycopg.AsyncConnection`, `__aenter__`/`__aexit__`, all query methods are `async def`, `_normalize_data_type` stays sync. `excluded_tables` and `connect_timeout` are configurable constructor parameters. `test_connection()` async method added. All 265 tests pass. Ready for Step 8 (Convert Factory to Async).
 
 ---
@@ -478,6 +520,12 @@ tests/test_lib_extraction_factory.py::TestFunctionSignatures (10 tests) - PASSED
 - `jsonb_columns` was declared as a parameter on `get_adapter()` in Step 4 but was not actually forwarded to `AsyncPostgresAdapter`. Step 8 was the right time to fix this since the adapter constructor already accepts `jsonb_columns` (from Step 6).
 - Mocking `SchemaIntrospector` as an async context manager requires `MagicMock` with `__aenter__`/`__aexit__` as `AsyncMock` methods, and `get_column_names` as `AsyncMock`. The pattern is consistent with Step 7's introspector test approach.
 - With `asyncio_mode = "auto"` in pytest config, `@pytest.mark.asyncio` decorators are optional but harmless -- they serve as documentation that the test is async.
+
+**Review**: PASS
+**Reviewed**: 2026-02-27T22:31:10-0800
+- **Intent match**: Pass -- Both functions are async def with signatures matching plan specification exactly, introspector uses async with, expected_columns is forwarded to validate_schema, get_adapter creates AsyncPostgresAdapter, and tests were updated in the existing file per plan.
+- **Assumption audit**: Pass -- No assumptions beyond the design; jsonb_columns is forwarded to the adapter constructor, no module-level caching exists, lock file uses Path.cwd(), and sync helpers correctly remain sync.
+- **Architectural drift**: Pass -- All imports use db_adapter.* package paths, factory depends on adapters/config/schema layers following the 5-layer architecture, no MC-specific code remains, and file locations match design spec.
 
 **Result**: Step 8 complete. Both `connect_and_validate()` and `get_adapter()` are now `async def`. Introspector usage is `async with`. `validate_schema()` (comparator) remains sync (pure logic). All 280 tests pass. Ready for Step 9 (Generalize Schema Fix Module).
 
@@ -534,6 +582,12 @@ tests/test_lib_extraction_fix.py::TestApplyFixes (12 tests) - PASSED
 - Adding a method to a Protocol class is a cascading change: the method must be implemented on all concrete adapters, and tests that assert the Protocol's method count must be updated. Planning for this upfront (as the plan did by noting "Step 9 adds a 6th method") helps but the test file reference is easy to miss.
 - `SchemaValidationResult.error_count` is a computed property, not a field -- passing it as a constructor arg silently fails (Pydantic ignores extra fields by default). Tests must use the actual required fields (`valid`, `missing_tables`, `missing_columns`).
 - Topological sort with cycle detection is important even for schema files -- circular FK references (e.g., self-referencing tables or mutual references) should not cause infinite loops. The visiting-set approach breaks cycles gracefully.
+
+**Review**: PASS
+**Reviewed**: 2026-02-27T22:30:55-0800
+- **Intent match**: Pass -- all 8 acceptance criteria met; COLUMN_DEFINITIONS removed, MC imports eliminated, function signatures match spec, execute added to Protocol, NotImplementedError wrapping raises RuntimeError per-call as specified.
+- **Assumption audit**: Pass -- no hidden assumptions; the design deferred the execute-on-Protocol vs separate-engine decision to planning, and the plan chose Protocol which the implementation follows faithfully.
+- **Architectural drift**: Pass -- file locations (schema/fix.py, adapters/base.py, adapters/postgres.py, adapters/supabase.py), import paths (db_adapter.*), Protocol typing pattern, and topological sort approach all align with the design doc's package structure and dependency direction.
 
 **Result**: Step 9 complete. Fix module is fully generalized: no hardcoded column definitions, no MC-specific imports, all functions accept caller-provided parameters. DatabaseClient Protocol has `execute` method for DDL. Topological sort ensures safe DDL execution order. All 342 tests pass. Ready for Step 10 (Generalize Backup/Restore).
 
@@ -595,6 +649,12 @@ tests/test_lib_extraction_backup.py::TestIdMaps (1 test) - PASSED
 - Version checking should be an error (not a warning) when the format is incompatible. The old code warned about version mismatch but continued anyway, which could silently corrupt data if the format changed.
 - AST-based string literal checks (for MC table names) catch string constants everywhere in the module, including dict keys, function arguments, and variable assignments. This is more thorough than grep but also catches false positives in English prose (e.g., "projects" in a docstring). The fix is to use different wording in prose.
 
+**Review**: PASS
+**Reviewed**: 2026-02-27T22:27:31-0800
+- **Intent match**: Pass -- all 7 acceptance criteria met; function signatures, BackupSchema-driven iteration, FK remapping, async/sync split, and version validation all match design intent exactly.
+- **Assumption audit**: Pass -- no hidden assumptions; child-row filtering by parent PKs during backup is a reasonable consistency guarantee consistent with the parents-first ordering contract.
+- **Architectural drift**: Pass -- file locations, import paths, Protocol typing, and public API exports all match the design doc's package structure.
+
 **Result**: Step 10 complete. Backup/restore is fully generalized: BackupSchema drives table iteration and FK remapping, no hardcoded table names, async backup/restore with sync validate, version 1.1 required. All 390 tests pass. Ready for Step 11 (Generalize Sync Module).
 
 ---
@@ -641,6 +701,12 @@ Full suite: 439 passed, 13 warnings in 1.08s
 - The dual-path sync design (direct vs backup/restore) cleanly separates concerns: flat tables with no FK relationships can use the simpler direct path, while hierarchical data with FK constraints should use the BackupSchema-driven path. The caller decides which path based on their data model.
 - Flat slug resolution (one `slug_field` per table) is simpler and sufficient when all tables in a sync group use the same slug column name. The plan correctly notes that callers needing different slug columns should invoke sync per-table group.
 - Patching runtime imports in tests requires patching the source module (`db_adapter.backup.backup_restore.backup_database`) not the importing module, since the name is not yet bound in the importing module's namespace.
+
+**Review**: PASS
+**Reviewed**: 2026-02-27T22:31:44-0800
+- **Intent match**: Pass -- All 7 acceptance criteria satisfied: zero hardcoded MC table names, no MC imports or subprocess, empty SyncResult defaults, async signatures with tables parameter, public resolve_url used from factory, and 49 tests pass.
+- **Assumption audit**: Pass -- Dual-path sync (direct vs backup/restore), flat slug resolution, per-row commits without transaction rollback, and runtime imports all trace to plan specifications or documented trade-offs with no undocumented assumptions.
+- **Architectural drift**: Pass -- sync.py remains in schema/ per project architecture, uses proper db_adapter.* package imports, follows the async patterns from earlier steps, and internal adapter creation uses the established load_db_config/resolve_url/AsyncPostgresAdapter chain.
 
 **Result**: Step 11 complete. Sync module is fully generalized: no hardcoded MC table names, caller-declared table lists, async compare/sync with dual-path (direct insert vs backup/restore), flat slug resolution, proper db_adapter imports, no subprocess usage. All 439 tests pass. Ready for Step 12 (Modernize CLI).
 
@@ -698,6 +764,13 @@ uv run pytest tests/ -v --tb=short
 - The `asyncio.iscoroutinefunction()` deprecation in Python 3.14+ means tests should use `inspect.iscoroutinefunction()` to avoid warnings.
 - The async wrapping pattern `def cmd_x(args): return asyncio.run(_async_x(args))` is clean and testable -- the sync wrapper can be source-inspected for `asyncio.run` presence without needing to mock the event loop.
 
+
+**Review**: PASS
+**Reviewed**: 2026-02-27T22:31:05-0800
+- **Intent match**: PASS -- All 7 acceptance criteria satisfied: no "Mission Control", no "python -m schema", no MC_DB_PROFILE, prog is "db-adapter", all cmd_* wrap asyncio.run(), no COLUMN_DEFINITIONS/fk_drop_order/fk_create_order, 44 tests pass.
+- **Assumption audit**: PASS -- No undocumented assumptions; _parse_expected_columns() regex parser, removal of _show_profile_data/_show_profile_comparison, and inspect.iscoroutinefunction() usage are all explicitly specified in the plan or documented in Trade-offs.
+- **Architectural drift**: PASS -- CLI sits in src/db_adapter/cli/ per design, imports flow downward to config/factory/schema layers, and cli/backup.py remains an unregistered submodule as specified.
+
 **Result**: Step 12 complete. CLI is fully modernized: program name is `db-adapter`, all MC-specific references removed, async calls wrapped with `asyncio.run()`, generic `--env-prefix` option added, `cmd_sync` accepts `--tables`/`--user-id`, `cmd_fix` accepts `--schema-file`/`--column-defs`, `_parse_expected_columns()` helper implemented, `cli/backup.py` updated. All 483 tests pass. Ready for Step 13 (Package Exports).
 
 ---
@@ -736,6 +809,12 @@ uv run pytest tests/ -v --tb=short
 - The `adapters/__init__.py` and `config/__init__.py` had already been set up with proper exports in earlier steps (Step 6 for adapters with conditional Supabase, Step 3 for config). This is the expected outcome of a well-sequenced plan -- later steps can reuse earlier work.
 - Cross-package consistency tests (verifying `from db_adapter import X` is the same object as `from db_adapter.subpkg import X`) are valuable for catching re-export issues where a name might inadvertently create a separate copy.
 - The `importlib.reload()` approach for circular import tests works but requires care -- it re-executes module-level code. In this case it was safe because the modules have no side effects at import time.
+
+**Review**: PASS
+**Reviewed**: 2026-02-27T22:31:00-0800
+- **Intent match**: Pass -- All acceptance criteria met; exports match design doc's item 12 specification exactly, including conditional Supabase and `__all__` lists in all five `__init__.py` files.
+- **Assumption audit**: Pass -- No assumptions beyond what the design and plan specified; export lists are exactly as documented.
+- **Architectural drift**: Pass -- All imports use proper `db_adapter.*` absolute paths; re-export layering (top-level to subpackage to module) follows standard Python library conventions and matches the design's approach.
 
 **Result**: Step 13 complete. All `__init__.py` files updated with full public API exports and `__all__` lists. Top-level `from db_adapter import ...` convenience imports work for all public names. Conditional `AsyncSupabaseAdapter` export handles optional dependency correctly. All 527 tests pass. Ready for Step 14 (Final Validation).
 

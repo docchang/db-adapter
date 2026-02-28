@@ -13,9 +13,9 @@
 | Task | Status | What It Proved |
 |------|--------|----------------|
 | lib-extraction | Complete | db-adapter can be extracted into a standalone async-first library with zero MC-specific code, 553 tests, 13/13 success criteria met |
-| release-prep | Not Started | (Pending) Version bump, git tag, and clean install verification |
+| release-prep | In Progress | Version bump to 0.1.1 and git tag complete; clean install verification pending |
 
-**Current State**: The lib-extraction task is complete. All 5 layers (adapters, config, factory, schema, backup/CLI) have been converted from sync MC-coupled code to a standalone async-first library with proper `db_adapter.*` package imports, Protocol typing, configurable constructors, and 553 passing tests. The library is functionally ready but has not yet been tagged for release. The release-prep task (version bump to 0.2.0, git tag, clean install verification) is the remaining work before Mission Control can adopt db-adapter as an external dependency.
+**Current State**: The lib-extraction task is complete. All 5 layers (adapters, config, factory, schema, backup/CLI) have been converted from sync MC-coupled code to a standalone async-first library with proper `db_adapter.*` package imports, Protocol typing, configurable constructors, and 553 passing tests. Version has been bumped to 0.1.1 and git tag `v0.1.1` created. Clean install verification from another project is the remaining work before the Core milestone is complete.
 
 ---
 
@@ -80,13 +80,13 @@ DB-ADAPTER SYSTEM STATE
 
     lib-extraction                              release-prep
     ──────────────                              ─────────────
-    Complete                                    Not Started
+    Complete                                    In Progress
 
     ┌──────────────────────────────────────┐     ┌─────────────────┐
     │           Core Lib Extraction        │     │  Release Prep   │
     │              EXTRACTION              │     │                 │
-    │             Complete                 │     │  Version bump   │
-    │                                      │     │  Git tag v0.2.0 │
+    │             Complete                 │     │  ✅ Version bump │
+    │                                      │     │  ✅ Git tag v0.1.1│
     │ Architecture                         │     │  Clean install  │
     │   • 5-layer async-first library      │     │  verification   │
     │   • Protocol-typed DatabaseClient    │────▶│                 │
@@ -346,8 +346,8 @@ MILESTONE COMPLETION MAP
 └── Test suite: 553 tests, 100% pass rate
 
  Pending -- release-prep
-├── Version bump to 0.2.0 (pyproject.toml + __init__.py)
-├── Git tag v0.2.0 on main branch
+├── ✅ Version bump to 0.1.1 (pyproject.toml + __init__.py)
+├── ✅ Git tag v0.1.1 on main branch
 ├── Clean install verification from git URL
 ├── Import verification in clean environment
 └── Supabase extra install verification
@@ -383,9 +383,9 @@ MILESTONE COMPLETION MAP
 
 The lib-extraction task is complete. The release-prep task is the remaining work to make the library consumable.
 
-**Next Task: release-prep**
-1. Bump version to `0.2.0` in `pyproject.toml` and `src/db_adapter/__init__.py`
-2. Create git tag `v0.2.0` on main branch
+**Next Task: release-prep** (version bump and tag done)
+1. ~~Bump version to `0.1.1` in `pyproject.toml` and `src/db_adapter/__init__.py`~~ Done
+2. ~~Create git tag `v0.1.1` on main branch~~ Done
 3. Verify clean install: `uv add git+ssh://git@github.com/docchang/db-adapter.git` in a fresh project
 4. Verify imports work: `from db_adapter import AsyncPostgresAdapter, DatabaseClient, get_adapter`
 5. Verify supabase extra: `uv add "db-adapter[supabase] @ git+ssh://..."` installs cleanly
@@ -401,7 +401,7 @@ The lib-extraction task is complete. The release-prep task is the remaining work
 ## References
 
 - [Core Task Spec](./core-task-spec.md)
-- [Lib-Extraction Design](./core-lib-extraction-design.md)
-- [Lib-Extraction Plan](./core-lib-extraction-plan.md)
-- [Lib-Extraction Plan Review](./core-lib-extraction-plan-review.md)
-- [Lib-Extraction Results](./core-lib-extraction-results.md)
+- [Lib-Extraction Design](../core-lib-extraction-design.md)
+- [Lib-Extraction Plan](../core-lib-extraction-plan.md)
+- [Lib-Extraction Plan Review](../core-lib-extraction-plan-review.md)
+- [Lib-Extraction Results](../core-lib-extraction-results.md)

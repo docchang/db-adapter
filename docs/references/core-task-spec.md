@@ -4,7 +4,7 @@
 Prove that db-adapter is a fully standalone, async-first Python library with zero Mission Control coupling — installable and importable by any Python 3.12+ project. Core transforms a raw copy of MC sync code into a clean, tested, async library ready for its first consumer.
 
 ## Project
-db-adapter — [Vision](./references/db-adapter-vision.md)
+db-adapter — [Vision](./db-adapter-vision.md)
 
 ## Task Dependency Diagram
 
@@ -47,15 +47,15 @@ db-adapter — [Vision](./references/db-adapter-vision.md)
   - `BackupSchema`-driven backup/restore (no hardcoded table names)
   - CLI commands wrap async operations with `asyncio.run()`
   - All tests pass with `uv run pytest`
-- **Results**: [core-lib-extraction-results.md](./core-lib-extraction-results.md)
+- **Results**: [core-lib-extraction-results.md](../core-lib-extraction-results.md)
 
 ### Task: release-prep
 - **Type**: Feature
 - **Validates**: That the library is installable from git in a clean environment and tagged for consumption
 - **Unlocks**: Integration milestone (MC adoption depends on a tagged, installable release)
 - **Success Criteria**:
-  - Version bumped to `0.2.0` in both `pyproject.toml` and `src/db_adapter/__init__.py`
-  - Git tag `v0.2.0` exists on main branch
+  - Version bumped to `0.1.1` in both `pyproject.toml` and `src/db_adapter/__init__.py`
+  - Git tag `v0.1.1` exists on main branch
   - `uv add git+ssh://git@github.com/docchang/db-adapter.git` succeeds in a clean virtual environment (separate project)
   - `python -c "from db_adapter import AsyncPostgresAdapter, DatabaseClient, get_adapter, connect_and_validate; print('OK')"` succeeds in that clean environment
   - `python -c "from db_adapter import BackupSchema, TableDef, ForeignKey, validate_schema; print('OK')"` succeeds in that clean environment
@@ -67,7 +67,7 @@ db-adapter — [Vision](./references/db-adapter-vision.md)
 2. Task: release-prep (requires lib-extraction)
 
 ## Integration Points
-- **release-prep → Integration milestone**: The tagged v0.2.0 release is what MC will add as a dependency (`uv add git+ssh://...@v0.2.0`). Without a tag, MC would pin to a commit hash, which is fragile.
+- **release-prep → Integration milestone**: The tagged v0.1.1 release is what MC will add as a dependency (`uv add git+ssh://...@v0.1.1`). Without a tag, MC would pin to a commit hash, which is fragile.
 - **release-prep → README**: README install URLs already point to `git+ssh://git@github.com/docchang/db-adapter.git` — no changes needed.
 
 ## Risk Assessment

@@ -281,18 +281,28 @@ db-adapter --env-prefix MC_ connect                                   # Use MC_D
 ## Development
 
 ```bash
-# Install with dev dependencies
+# Clone and install
+git clone git@github.com:docchang/db-adapter.git
+cd db-adapter
 uv sync --extra dev
 
 # Install with Supabase support
 uv sync --extra supabase
 
-# Run tests
+# Run all tests (553 tests)
 uv run pytest
 
+# Run a single test file
+uv run pytest tests/test_lib_extraction_adapters.py
+
 # Run a single test
-uv run pytest tests/test_file.py::test_name
+uv run pytest tests/test_lib_extraction_adapters.py::test_name
+
+# Run with verbose output
+uv run pytest -v
 ```
+
+Tests use `pytest-asyncio` with `asyncio_mode = "auto"` — async test functions are detected automatically.
 
 ## Dependencies
 
