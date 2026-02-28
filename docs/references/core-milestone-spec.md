@@ -696,7 +696,7 @@ Return RestoreSummary per table: {inserted, skipped, failed, errors}
 
 - [Roadmap](./db-adapter-roadmap.md) - Full milestone roadmap (Core → Integration → Distribution)
 - [Architecture Doc](./db-adapter-architecture.md) - Complete technical architecture
-- [Vision](./reference/db-adapter-vision.md) - Product vision and success metrics
+- [Vision](./db-adapter-vision.md) - Product vision and success metrics
 - [Extraction Design](./core-lib-extraction-design.md) - Detailed analysis of every coupling point and async migration plan
 
 ---

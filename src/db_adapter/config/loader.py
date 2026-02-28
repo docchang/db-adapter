@@ -1,68 +1,37 @@
-"""Configuration management for Mission Control MCP."""
+"""Configuration loader for db-adapter.
+
+Loads database profiles from a TOML configuration file (db.toml).
+The config file is expected in the consuming project's working directory.
+
+Usage:
+    >>> from db_adapter.config.loader import load_db_config
+    >>> config = load_db_config()  # reads ./db.toml
+    >>> config = load_db_config(Path("/path/to/db.toml"))
+"""
 
 import tomllib
-from functools import lru_cache
 from pathlib import Path
 
-from pydantic import AliasChoices, Field
-
-from creational.common.config import SharedSettings
-
-from schema.models import DatabaseConfig, DatabaseProfile
-
-
-class Settings(SharedSettings):
-    """Application settings for Mission Control.
-
-    Inherits from SharedSettings for auth credentials (Supabase URL/key).
-    Data connections are handled separately via db.toml profiles.
-
-    Separation of concerns:
-    - SharedSettings: Auth & feedback (Supabase connection)
-    - db.toml: Data connections (RDS/local profiles)
-    """
-
-    # Service identity
-    service_slug: str = "mission-control-mcp"
-
-    # Development mode
-    dev_user_id: str = "7270cadc-1dea-457b-bb8e-d9708a867bdc"
-
-    # Override supabase_key to accept multiple env var names
-    supabase_key: str = Field(
-        default="",
-        validation_alias=AliasChoices("SUPABASE_KEY", "SUPABASE_SERVICE_KEY"),
-    )
-
-    # OAuth base URL - MC_BASE_URL takes precedence over BASE_URL
-    # Allows MC and VP to have different base URLs in shared gateway container
-    base_url: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices("MC_BASE_URL", "BASE_URL"),
-    )
-
-
-@lru_cache
-def get_settings() -> Settings:
-    """Get cached settings instance."""
-    return Settings()
+from db_adapter.config.models import DatabaseConfig, DatabaseProfile
 
 
 def load_db_config(config_path: Path | None = None) -> DatabaseConfig:
     """Load database configuration from TOML file.
 
     Args:
-        config_path: Path to db.toml (default: core/db.toml)
+        config_path: Path to db.toml. Defaults to ``Path.cwd() / "db.toml"``
+            so the library reads config from the consuming project's working
+            directory, not from inside the installed package.
 
     Returns:
-        DatabaseConfig with all profiles
+        DatabaseConfig with all profiles.
 
     Raises:
-        FileNotFoundError: If config file doesn't exist
-        ValueError: If config format is invalid
+        FileNotFoundError: If config file doesn't exist.
+        ValueError: If config format is invalid.
     """
     if config_path is None:
-        config_path = Path(__file__).parent / "db.toml"
+        config_path = Path.cwd() / "db.toml"
 
     if not config_path.exists():
         raise FileNotFoundError(
@@ -74,12 +43,12 @@ def load_db_config(config_path: Path | None = None) -> DatabaseConfig:
         data = tomllib.load(f)
 
     # Parse profiles
-    profiles = {}
+    profiles: dict[str, DatabaseProfile] = {}
     for name, profile_data in data.get("profiles", {}).items():
         profiles[name] = DatabaseProfile(**profile_data)
 
     # Parse schema settings
-    schema_settings = data.get("schema", {})
+    schema_settings: dict = data.get("schema", {})
 
     return DatabaseConfig(
         profiles=profiles,

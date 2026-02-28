@@ -1,110 +1,73 @@
-"""Schema fix module - automatically repair schema drift.
+"""Schema fix module -- automatically repair schema drift.
 
-Detects missing tables and columns, backs up the database, and applies fixes.
+Detects missing tables and columns, optionally backs up affected data,
+and applies DDL fixes via the ``DatabaseClient.execute()`` Protocol method.
+
+All functions accept caller-provided parameters -- no hardcoded table names,
+column definitions, or MC-specific logic.
 
 Usage:
-    from schema.fix import generate_fix_plan, apply_fixes, FixPlan
+    from db_adapter.schema.fix import generate_fix_plan, apply_fixes
+    from db_adapter.schema.comparator import validate_schema
+    from db_adapter.schema.introspector import SchemaIntrospector
 
-    # Generate plan
-    plan = generate_fix_plan(profile_name)
+    # 1. Introspect and compare
+    async with SchemaIntrospector(url) as introspector:
+        actual = await introspector.get_column_names()
+    result = validate_schema(actual, expected_columns)
 
-    # Apply fixes (backs up first)
-    result = apply_fixes(profile_name, dry_run=False)
+    # 2. Generate plan
+    plan = generate_fix_plan(result, column_definitions, "schema.sql")
+
+    # 3. Apply fixes
+    fix_result = await apply_fixes(adapter, plan, confirm=True)
 """
 
 import re
+from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 
+from db_adapter.schema.models import SchemaValidationResult
+
 if TYPE_CHECKING:
-    from adapters import PostgresAdapter
+    from db_adapter.adapters.base import DatabaseClient
 
 
-# Column definitions extracted from schema.sql
-# Maps table.column -> SQL column definition
-COLUMN_DEFINITIONS: dict[str, str] = {
-    # projects table
-    "projects.id": "SERIAL PRIMARY KEY",
-    "projects.user_id": "UUID NOT NULL",
-    "projects.name": "VARCHAR(100) NOT NULL",
-    "projects.slug": "VARCHAR(100) NOT NULL",
-    "projects.status": "VARCHAR(20) DEFAULT 'active'",
-    "projects.phase": "VARCHAR(100)",
-    "projects.objective": "TEXT",
-    "projects.business_value": "TEXT",
-    "projects.next_action": "TEXT",
-    "projects.blocker": "TEXT",
-    "projects.backburner_reason": "TEXT",
-    "projects.reactivation_trigger": "TEXT",
-    "projects.notes": "TEXT",
-    "projects.target_market": "TEXT",
-    "projects.monthly_cost": "TEXT",
-    "projects.projected_mrr": "TEXT",
-    "projects.revenue_model": "TEXT",
-    "projects.architecture_summary": "TEXT",
-    "projects.artifacts_path": "TEXT",
-    "projects.created_at": "TIMESTAMPTZ DEFAULT NOW()",
-    "projects.updated_at": "TIMESTAMPTZ DEFAULT NOW()",
-    # milestones table
-    "milestones.id": "SERIAL PRIMARY KEY",
-    "milestones.user_id": "UUID NOT NULL",
-    "milestones.project_id": "INT NOT NULL REFERENCES projects(id) ON DELETE CASCADE",
-    "milestones.slug": "VARCHAR(100) NOT NULL",
-    "milestones.name": "VARCHAR(100) NOT NULL",
-    "milestones.description": "TEXT",
-    "milestones.status": "VARCHAR(20) DEFAULT 'active'",
-    "milestones.goal": "TEXT",
-    "milestones.not_included": "TEXT",
-    "milestones.strategic_rationale": "TEXT",
-    "milestones.risks": "JSONB",
-    "milestones.design_decisions": "TEXT",
-    "milestones.tech_components": "TEXT[]",
-    "milestones.open_questions": "TEXT",
-    "milestones.created_at": "TIMESTAMPTZ DEFAULT NOW()",
-    "milestones.updated_at": "TIMESTAMPTZ DEFAULT NOW()",
-    "milestones.completed_at": "TIMESTAMPTZ",
-    # tasks table
-    "tasks.id": "SERIAL PRIMARY KEY",
-    "tasks.user_id": "UUID NOT NULL",
-    "tasks.project_id": "INT NOT NULL REFERENCES projects(id) ON DELETE CASCADE",
-    "tasks.milestone_id": "INT REFERENCES milestones(id) ON DELETE SET NULL",
-    "tasks.slug": "VARCHAR(100) NOT NULL",
-    "tasks.name": "VARCHAR(100) NOT NULL",
-    "tasks.type": "VARCHAR(20) NOT NULL",
-    "tasks.status": "VARCHAR(20) DEFAULT 'planned'",
-    "tasks.is_optional": "BOOLEAN DEFAULT FALSE",
-    "tasks.objective": "TEXT",
-    "tasks.unlocks": "TEXT",
-    "tasks.depends_on": "TEXT[]",
-    "tasks.lessons_learned": "TEXT",
-    "tasks.diagram": "TEXT",
-    "tasks.started_at": "TIMESTAMPTZ",
-    "tasks.created_at": "TIMESTAMPTZ DEFAULT NOW()",
-    "tasks.updated_at": "TIMESTAMPTZ DEFAULT NOW()",
-    "tasks.completed_at": "TIMESTAMPTZ",
-}
+# ------------------------------------------------------------------
+# Fix data classes
+# ------------------------------------------------------------------
 
 
 @dataclass
 class ColumnFix:
-    """A column to be added."""
+    """A column to be added via ALTER TABLE.
+
+    Example:
+        fix = ColumnFix(table="users", column="email", definition="TEXT NOT NULL")
+        fix.to_sql()
+        # 'ALTER TABLE users ADD COLUMN email TEXT;'
+    """
 
     table: str
     column: str
     definition: str
 
     def to_sql(self) -> str:
-        """Generate ALTER TABLE statement."""
-        # Strip PRIMARY KEY, NOT NULL, and REFERENCES for ALTER ADD COLUMN
-        # (these can't be added via simple ALTER for existing tables with data)
+        """Generate ALTER TABLE ADD COLUMN statement.
+
+        Strips PRIMARY KEY and NOT NULL from the definition for safety
+        (can't add NOT NULL to existing table with data, can't add PK
+        via simple ALTER).  Keeps REFERENCES clauses for foreign keys.
+        """
         definition = self.definition
 
         # For foreign keys, keep the REFERENCES part
         if "REFERENCES" in definition:
-            # Keep it as-is for FK columns
             pass
         else:
             # Remove NOT NULL for safety (can't add NOT NULL to existing table with data)
@@ -119,7 +82,13 @@ class ColumnFix:
 
 @dataclass
 class TableFix:
-    """A table to be created (new table or recreated)."""
+    """A table to be created (new table or recreated via DROP+CREATE).
+
+    Example:
+        fix = TableFix(table="users", create_sql="CREATE TABLE users (...);")
+        fix.to_sql()
+        # 'CREATE TABLE users (...);'
+    """
 
     table: str
     create_sql: str
@@ -132,12 +101,24 @@ class TableFix:
 
 @dataclass
 class FixPlan:
-    """Plan for fixing schema drift."""
+    """Plan for fixing schema drift.
 
-    profile_name: str
+    Attributes:
+        missing_tables: Tables that need to be created from scratch.
+        missing_columns: Single columns to add via ALTER TABLE.
+        tables_to_recreate: Tables with 2+ missing columns (DROP+CREATE).
+        drop_order: Reverse topological order for safe table drops
+            (child tables before parent tables).
+        create_order: Forward topological order for safe table creates
+            (parent tables before child tables).
+        error: Error message if plan generation failed.
+    """
+
     missing_tables: list[TableFix] = field(default_factory=list)
     missing_columns: list[ColumnFix] = field(default_factory=list)
-    tables_to_recreate: list[TableFix] = field(default_factory=list)  # Tables with 2+ missing cols
+    tables_to_recreate: list[TableFix] = field(default_factory=list)
+    drop_order: list[str] = field(default_factory=list)
+    create_order: list[str] = field(default_factory=list)
     error: str | None = None
 
     @property
@@ -152,10 +133,18 @@ class FixPlan:
 
 
 class FixResult(BaseModel):
-    """Result of applying fixes."""
+    """Result of applying schema fixes.
+
+    Attributes:
+        success: True if all fixes were applied successfully.
+        backup_path: Path to pre-fix backup (if backup_fn was provided).
+        tables_created: Number of new tables created.
+        tables_recreated: Number of tables dropped and recreated.
+        columns_added: Number of columns added via ALTER TABLE.
+        error: Error message if fix failed.
+    """
 
     success: bool = False
-    profile_name: str = ""
     backup_path: str | None = None
     tables_created: int = 0
     tables_recreated: int = 0
@@ -163,20 +152,30 @@ class FixResult(BaseModel):
     error: str | None = None
 
 
-def _get_table_create_sql(table_name: str, schema_file: str | None = None) -> str:
-    """Get CREATE TABLE SQL for a table from schema file.
+# ------------------------------------------------------------------
+# Schema file parsing
+# ------------------------------------------------------------------
+
+
+def _get_table_create_sql(table_name: str, schema_file: str | Path) -> str:
+    """Get CREATE TABLE SQL for a table from a schema file.
 
     Args:
-        table_name: Name of the table to get CREATE SQL for
-        schema_file: Path to schema file (defaults to schema.sql, use local-schema.sql for local)
+        table_name: Name of the table to get CREATE SQL for.
+        schema_file: Path to the SQL schema file.  Required -- there is
+            no default or fallback path.
 
     Returns:
-        CREATE TABLE SQL statement
+        The CREATE TABLE SQL statement for the given table.
+
+    Raises:
+        FileNotFoundError: If the schema file does not exist.
+        ValueError: If the table is not found in the schema file.
+
+    Example:
+        sql = _get_table_create_sql("users", "/app/schema.sql")
     """
-    if schema_file:
-        schema_path = Path(schema_file)
-    else:
-        schema_path = Path(__file__).parent.parent / "schema.sql"
+    schema_path = Path(schema_file)
 
     if not schema_path.exists():
         raise FileNotFoundError(f"Schema file not found: {schema_path}")
@@ -194,49 +193,134 @@ def _get_table_create_sql(table_name: str, schema_file: str | None = None) -> st
     raise ValueError(f"CREATE TABLE for {table_name} not found in {schema_path.name}")
 
 
-def generate_fix_plan(profile_name: str | None = None, schema_file: str | None = None) -> FixPlan:
+def _parse_fk_dependencies(schema_file: str | Path) -> dict[str, set[str]]:
+    """Parse REFERENCES clauses from a schema file to build an FK dependency graph.
+
+    Returns a dict mapping table_name -> set of tables it depends on (references).
+
+    Args:
+        schema_file: Path to the SQL schema file.
+
+    Returns:
+        Dict mapping each table to the set of tables it references via FK.
+
+    Example:
+        deps = _parse_fk_dependencies("schema.sql")
+        # {"chapters": {"books"}, "reviews": {"books", "chapters"}}
+    """
+    schema_path = Path(schema_file)
+    if not schema_path.exists():
+        return {}
+
+    content = schema_path.read_text()
+    dependencies: dict[str, set[str]] = {}
+
+    # Find all CREATE TABLE blocks
+    table_pattern = re.compile(
+        r"CREATE TABLE(?:\s+IF NOT EXISTS)?\s+(\w+)\s*\(([^;]+)\);",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    for match in table_pattern.finditer(content):
+        table_name = match.group(1)
+        table_body = match.group(2)
+        dependencies[table_name] = set()
+
+        # Find all REFERENCES clauses within this table's body
+        ref_pattern = re.compile(r"REFERENCES\s+(\w+)\s*\(", re.IGNORECASE)
+        for ref_match in ref_pattern.finditer(table_body):
+            referenced_table = ref_match.group(1)
+            if referenced_table != table_name:  # Skip self-references
+                dependencies[table_name].add(referenced_table)
+
+    return dependencies
+
+
+def _topological_sort(dependencies: dict[str, set[str]], tables: list[str]) -> list[str]:
+    """Topological sort of tables based on FK dependencies.
+
+    Returns tables in forward order: parent tables first, child tables last.
+    Tables not in the dependency graph are appended at the end.
+
+    Args:
+        dependencies: FK dependency graph (table -> set of referenced tables).
+        tables: List of table names to sort.
+
+    Returns:
+        Tables sorted so that parent tables come before child tables.
+    """
+    # Filter dependencies to only include relevant tables
+    relevant = {t: dependencies.get(t, set()) & set(tables) for t in tables}
+
+    sorted_tables: list[str] = []
+    visited: set[str] = set()
+    visiting: set[str] = set()  # For cycle detection
+
+    def visit(table: str) -> None:
+        if table in visited:
+            return
+        if table in visiting:
+            # Cycle detected -- break it by just adding the table
+            return
+        visiting.add(table)
+        for dep in relevant.get(table, set()):
+            visit(dep)
+        visiting.discard(table)
+        visited.add(table)
+        sorted_tables.append(table)
+
+    for table in tables:
+        visit(table)
+
+    return sorted_tables
+
+
+# ------------------------------------------------------------------
+# Plan generation
+# ------------------------------------------------------------------
+
+
+def generate_fix_plan(
+    validation_result: SchemaValidationResult,
+    column_definitions: dict[str, str],
+    schema_file: str | Path,
+) -> FixPlan:
     """Generate a plan to fix schema drift.
+
+    Pure sync logic -- reads schema file for CREATE TABLE SQL and builds
+    a fix plan based on the validation result.
 
     If a table has 2+ missing columns, it will be scheduled for DROP+CREATE.
     If a table has 1 missing column, it will use ALTER ADD COLUMN.
 
     Args:
-        profile_name: Profile to check (uses current if None)
-        schema_file: Path to schema file (auto-selects based on profile if None)
+        validation_result: Result from ``validate_schema(actual, expected)``.
+            Contains ``missing_tables``, ``missing_columns``, and ``error_count``.
+        column_definitions: Mapping of ``"table.column"`` to SQL type definition
+            strings.  Used for ALTER TABLE ADD COLUMN statements.
+            Example: ``{"users.email": "TEXT NOT NULL", "users.status": "VARCHAR(20) DEFAULT 'active'"}``.
+        schema_file: Path to the SQL schema file containing CREATE TABLE
+            statements.  Used for table creation/recreation.
 
     Returns:
-        FixPlan with missing tables, columns, and tables to recreate
+        ``FixPlan`` with missing tables, columns, tables to recreate, and
+        topological ordering for safe DDL execution.
+
+    Example:
+        plan = generate_fix_plan(validation_result, column_defs, "schema.sql")
+        if plan.has_fixes:
+            result = await apply_fixes(adapter, plan, confirm=True)
     """
-    from collections import defaultdict
+    plan = FixPlan()
 
-    from db import connect_and_validate, read_profile_lock
-
-    # Determine profile
-    if not profile_name:
-        profile_name = read_profile_lock()
-        if not profile_name:
-            return FixPlan(profile_name="", error="No profile configured")
-
-    # Always use schema.sql (canonical schema) for creating tables
-    # local-schema.sql is just for documentation of the legacy state
-
-    plan = FixPlan(profile_name=profile_name)
-
-    # Validate schema to get differences (validate_only=True to not write lock file)
-    result = connect_and_validate(profile_name=profile_name, validate_only=True)
-
-    if result.success:
-        # No fixes needed
+    if validation_result.error_count == 0:
         return plan
 
-    if not result.schema_report:
-        plan.error = result.error or "Unknown error"
-        return plan
-
-    report = result.schema_report
+    # Parse FK dependencies for topological ordering
+    fk_deps = _parse_fk_dependencies(schema_file)
 
     # Process missing tables (completely new tables)
-    for table in report.missing_tables:
+    for table in validation_result.missing_tables:
         try:
             create_sql = _get_table_create_sql(table, schema_file)
             plan.missing_tables.append(TableFix(table=table, create_sql=create_sql))
@@ -246,11 +330,11 @@ def generate_fix_plan(profile_name: str | None = None, schema_file: str | None =
 
     # Group missing columns by table
     columns_by_table: dict[str, list[tuple[str, str]]] = defaultdict(list)
-    for col_diff in report.missing_columns:
+    for col_diff in validation_result.missing_columns:
         key = f"{col_diff.table}.{col_diff.column}"
-        if key in COLUMN_DEFINITIONS:
+        if key in column_definitions:
             columns_by_table[col_diff.table].append(
-                (col_diff.column, COLUMN_DEFINITIONS[key])
+                (col_diff.column, column_definitions[key])
             )
         else:
             plan.error = f"Unknown column definition for {key}"
@@ -275,39 +359,66 @@ def generate_fix_plan(profile_name: str | None = None, schema_file: str | None =
                 ColumnFix(table=table, column=col_name, definition=col_def)
             )
 
+    # Compute topological ordering for all tables that need DDL
+    all_affected_tables = (
+        [tf.table for tf in plan.missing_tables]
+        + [tf.table for tf in plan.tables_to_recreate]
+    )
+    if all_affected_tables:
+        forward_order = _topological_sort(fk_deps, all_affected_tables)
+        plan.create_order = forward_order
+        plan.drop_order = list(reversed(forward_order))
+
     return plan
 
 
-def apply_fixes(
-    profile_name: str | None = None,
+# ------------------------------------------------------------------
+# Fix application
+# ------------------------------------------------------------------
+
+
+async def apply_fixes(
+    adapter: "DatabaseClient",
+    plan: FixPlan,
+    backup_fn: Callable[["DatabaseClient", str], Awaitable[str]] | None = None,
+    restore_fn: Callable[["DatabaseClient", str], Awaitable[None]] | None = None,
+    verify_fn: Callable[["DatabaseClient"], Awaitable[bool]] | None = None,
     dry_run: bool = True,
     confirm: bool = False,
 ) -> FixResult:
     """Apply schema fixes to a database.
 
+    Executes DDL statements via the ``adapter.execute()`` Protocol method.
+    Optionally backs up tables before destructive operations and verifies
+    post-fix state.
+
     Args:
-        profile_name: Profile to fix (uses current if None)
-        dry_run: If True, only show what would be done
-        confirm: Must be True to actually apply fixes
+        adapter: Database adapter implementing ``DatabaseClient`` Protocol.
+            Must support ``execute()`` for DDL -- adapters that don't
+            (e.g., Supabase) will raise ``RuntimeError``.
+        plan: Fix plan from ``generate_fix_plan()``.
+        backup_fn: Optional async callback to back up a single table
+            before DROP+CREATE.  Signature: ``backup_fn(adapter, table_name) -> backup_path``.
+        restore_fn: Optional async callback to restore a single table
+            from backup if fix fails.  Signature: ``restore_fn(adapter, backup_path) -> None``.
+        verify_fn: Optional async callback to verify post-fix state.
+            Signature: ``verify_fn(adapter) -> bool``.
+        dry_run: If True, only report what would be done without executing.
+        confirm: Must be True to actually apply fixes (safety guard).
 
     Returns:
-        FixResult with outcome
+        ``FixResult`` with outcome.
+
+    Raises:
+        RuntimeError: If the adapter does not support DDL operations
+            (raises ``NotImplementedError`` on ``execute()``).
+
+    Example:
+        result = await apply_fixes(adapter, plan, confirm=True)
+        if result.success:
+            print(f"Fixed: {result.tables_created} created, {result.columns_added} added")
     """
-    from adapters import PostgresAdapter
-    from backup.backup_restore import backup_database
-    from config import load_db_config
-    from db import _resolve_url, connect_and_validate, read_profile_lock
-
-    # Determine profile
-    if not profile_name:
-        profile_name = read_profile_lock()
-        if not profile_name:
-            return FixResult(error="No profile configured")
-
-    result = FixResult(profile_name=profile_name)
-
-    # Generate plan
-    plan = generate_fix_plan(profile_name)
+    result = FixResult()
 
     if plan.error:
         result.error = plan.error
@@ -321,90 +432,97 @@ def apply_fixes(
     if dry_run:
         result.success = True
         result.tables_created = len(plan.missing_tables)
+        result.tables_recreated = len(plan.tables_to_recreate)
         result.columns_added = len(plan.missing_columns)
         return result
 
     # Safety check
     if not confirm:
-        result.error = "Fix requires --confirm flag"
+        result.error = "Fix requires confirm=True"
         return result
 
-    # Load config and get connection
     try:
-        config = load_db_config()
-        if profile_name not in config.profiles:
-            result.error = f"Profile '{profile_name}' not found"
-            return result
+        # Build lookup for ordered operations
+        missing_table_map = {tf.table: tf for tf in plan.missing_tables}
+        recreate_table_map = {tf.table: tf for tf in plan.tables_to_recreate}
 
-        url = _resolve_url(config.profiles[profile_name])
-    except Exception as e:
-        result.error = f"Failed to load config: {e}"
-        return result
+        # 1. Create missing tables in topological order (parents first)
+        tables_to_create = [t for t in plan.create_order if t in missing_table_map]
+        # Also include tables not in create_order (no FK deps)
+        for tf in plan.missing_tables:
+            if tf.table not in tables_to_create:
+                tables_to_create.append(tf.table)
 
-    # Backup first
-    try:
-        from datetime import datetime
-
-        backup_dir = Path(__file__).parent.parent / "backup" / "backups"
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y-%m-%d-%H%M")
-        backup_path = backup_dir / f"pre-fix-{profile_name}-{timestamp}.json"
-
-        # Use existing backup infrastructure
-        backup_database(output_path=str(backup_path))
-        result.backup_path = str(backup_path)
-    except Exception as e:
-        result.error = f"Backup failed: {e}"
-        return result
-
-    # Apply fixes
-    try:
-        adapter = PostgresAdapter(database_url=url)
-
-        # 1. Create missing tables first (order matters for FKs)
-        for table_fix in plan.missing_tables:
-            with adapter._conn.cursor() as cur:
-                cur.execute(table_fix.to_sql())
-            adapter._conn.commit()
+        for table_name in tables_to_create:
+            table_fix = missing_table_map[table_name]
+            try:
+                await adapter.execute(table_fix.to_sql())
+            except NotImplementedError:
+                raise RuntimeError("DDL operations not supported for this adapter type")
             result.tables_created += 1
 
-        # 2. Recreate tables with multiple missing columns (DROP + CREATE + restore)
-        for table_fix in plan.tables_to_recreate:
-            # DROP the table (CASCADE to handle FKs)
-            with adapter._conn.cursor() as cur:
-                cur.execute(f"DROP TABLE IF EXISTS {table_fix.table} CASCADE;")
-            adapter._conn.commit()
+        # 2. Recreate tables with multiple missing columns
+        # Drop in reverse topological order (children first)
+        tables_to_drop = [t for t in plan.drop_order if t in recreate_table_map]
+        for tf in plan.tables_to_recreate:
+            if tf.table not in tables_to_drop:
+                tables_to_drop.append(tf.table)
 
-            # CREATE the table fresh
-            with adapter._conn.cursor() as cur:
-                cur.execute(table_fix.to_sql())
-            adapter._conn.commit()
+        backup_paths: dict[str, str] = {}
 
+        for table_name in tables_to_drop:
+            # Backup before drop if callback provided
+            if backup_fn is not None:
+                backup_path = await backup_fn(adapter, table_name)
+                backup_paths[table_name] = backup_path
+                if result.backup_path is None:
+                    result.backup_path = backup_path
+
+            try:
+                await adapter.execute(f"DROP TABLE IF EXISTS {table_name} CASCADE;")
+            except NotImplementedError:
+                raise RuntimeError("DDL operations not supported for this adapter type")
+
+        # Create in forward topological order (parents first)
+        tables_to_create_after_drop = [t for t in plan.create_order if t in recreate_table_map]
+        for tf in plan.tables_to_recreate:
+            if tf.table not in tables_to_create_after_drop:
+                tables_to_create_after_drop.append(tf.table)
+
+        for table_name in tables_to_create_after_drop:
+            table_fix = recreate_table_map[table_name]
+            try:
+                await adapter.execute(table_fix.to_sql())
+            except NotImplementedError:
+                raise RuntimeError("DDL operations not supported for this adapter type")
             result.tables_recreated += 1
+
+        # Restore data if callback provided
+        if restore_fn is not None:
+            for table_name in tables_to_create_after_drop:
+                if table_name in backup_paths:
+                    await restore_fn(adapter, backup_paths[table_name])
 
         # 3. Add single missing columns via ALTER
         for col_fix in plan.missing_columns:
-            with adapter._conn.cursor() as cur:
-                cur.execute(col_fix.to_sql())
-            adapter._conn.commit()
+            try:
+                await adapter.execute(col_fix.to_sql())
+            except NotImplementedError:
+                raise RuntimeError("DDL operations not supported for this adapter type")
             result.columns_added += 1
 
-        adapter.close()
-
-        # 4. Restore data from backup (if we recreated any tables)
-        if plan.tables_to_recreate and result.backup_path:
-            from backup.backup_restore import restore_database
-
-            restore_database(result.backup_path, mode="skip", dry_run=False)
-
-        # Verify the fix worked (validate_only=True to not write lock file)
-        verify_result = connect_and_validate(profile_name=profile_name, validate_only=True)
-        if not verify_result.success:
-            result.error = f"Fix applied but verification failed: {verify_result.error}"
-            return result
+        # 4. Verify if callback provided
+        if verify_fn is not None:
+            verified = await verify_fn(adapter)
+            if not verified:
+                result.error = "Fix applied but verification failed"
+                return result
 
         result.success = True
 
+    except RuntimeError:
+        # Re-raise RuntimeError (DDL not supported) without wrapping
+        raise
     except Exception as e:
         result.error = f"Failed to apply fixes: {e}"
         return result

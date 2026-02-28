@@ -1,82 +1,166 @@
-"""CLI module for schema management.
+"""CLI module for database schema management and adapter toolkit.
 
-Provides commands for database profile management and schema validation.
+Provides commands for database profile management, schema validation,
+schema fix, and cross-profile data sync.
 
 Usage:
-    MC_DB_PROFILE=rds python -m schema connect
-    python -m schema status
-    python -m schema profiles
-    python -m schema validate
-    python -m schema sync --from rds --dry-run
-    python -m schema sync --from rds --confirm
+    DB_PROFILE=rds db-adapter connect
+    db-adapter status
+    db-adapter profiles
+    db-adapter validate
+    db-adapter fix --schema-file schema.sql --column-defs defs.json --confirm
+    db-adapter sync --from rds --tables projects,milestones --user-id abc123 --dry-run
+    db-adapter sync --from rds --tables projects,milestones --user-id abc123 --confirm
 
 Commands:
     connect   - Connect to database and validate schema
     status    - Show current connection status
     profiles  - List available profiles
     validate  - Re-validate current profile schema
+    fix       - Fix schema drift by adding missing tables and columns
     sync      - Sync data from another profile to current profile
 """
 
 import argparse
-import os
+import asyncio
+import json
+import re
 import sys
 from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
-from rich.panel import Panel
 
-from config import load_db_config
-from db import (
+from db_adapter.config.loader import load_db_config
+from db_adapter.factory import (
     connect_and_validate,
     read_profile_lock,
     get_active_profile_name,
-    get_dev_user_id,
-    _resolve_url,
     ProfileNotFoundError,
 )
-from schema.sync import compare_profiles, sync_data
+from db_adapter.schema.sync import compare_profiles, sync_data
 
 console = Console()
 
 
-def cmd_connect(args: argparse.Namespace) -> int:
-    """Connect to database and validate schema.
+# ============================================================================
+# Schema file parsing (CLI-internal helper)
+# ============================================================================
 
-    Uses MC_DB_PROFILE env var or existing .db-profile lock file
-    to determine which profile to connect to.
 
-    When switching profiles, shows a data comparison report.
+def _parse_expected_columns(schema_file: str | Path) -> dict[str, set[str]]:
+    """Parse CREATE TABLE statements from a SQL file into expected columns.
+
+    Reads the schema file, finds all CREATE TABLE blocks, and extracts
+    table names and column names from each.
+
+    Args:
+        schema_file: Path to a SQL file containing CREATE TABLE statements.
 
     Returns:
-        0 on success, 1 on failure
+        Dict mapping table name to set of column names.
+        Example: ``{"users": {"id", "email", "name"}, "orders": {"id", "total"}}``
+
+    Raises:
+        FileNotFoundError: If the schema file does not exist.
+        ValueError: If no CREATE TABLE statements found in the file.
+
+    Example:
+        >>> expected = _parse_expected_columns("schema.sql")
+        >>> expected["users"]
+        {'id', 'email', 'name', 'created_at'}
     """
-    # Get current profile before switching (for comparison)
+    schema_path = Path(schema_file)
+    if not schema_path.exists():
+        raise FileNotFoundError(f"Schema file not found: {schema_path}")
+
+    content = schema_path.read_text()
+
+    # Find all CREATE TABLE blocks
+    table_pattern = re.compile(
+        r"CREATE TABLE(?:\s+IF NOT EXISTS)?\s+(\w+)\s*\(([^;]+)\);",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    result: dict[str, set[str]] = {}
+
+    for match in table_pattern.finditer(content):
+        table_name = match.group(1)
+        body = match.group(2)
+
+        columns: set[str] = set()
+        for line in body.split("\n"):
+            line = line.strip().rstrip(",")
+            if not line:
+                continue
+            # Skip constraints (PRIMARY KEY, FOREIGN KEY, UNIQUE, CHECK, CONSTRAINT)
+            first_word = line.split()[0].upper() if line.split() else ""
+            if first_word in ("PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "CONSTRAINT"):
+                continue
+            # First word of the line is the column name
+            col_name = line.split()[0]
+            # Skip if it looks like a SQL keyword (all-caps, known keywords)
+            if col_name.upper() in ("CREATE", "TABLE", "IF", "NOT", "EXISTS"):
+                continue
+            columns.add(col_name)
+
+        if columns:
+            result[table_name] = columns
+
+    if not result:
+        raise ValueError(
+            f"No CREATE TABLE statements found in {schema_path.name}"
+        )
+
+    return result
+
+
+# ============================================================================
+# Async command implementations
+# ============================================================================
+
+
+async def _async_connect(args: argparse.Namespace) -> int:
+    """Async implementation for connect command.
+
+    Args:
+        args: Parsed arguments with env_prefix.
+
+    Returns:
+        0 on success, 1 on failure.
+    """
+    env_prefix = getattr(args, "env_prefix", "")
+
     previous_profile = read_profile_lock()
 
     console.print("Connecting to database...", style="dim")
 
-    result = connect_and_validate()
+    result = await connect_and_validate(env_prefix=env_prefix)
 
     if result.success:
         console.print()
-        console.print(f"[bold green]✓[/bold green] Connected to profile: [bold cyan]{result.profile_name}[/bold cyan]")
-        console.print(f"  Schema validation: [green]PASSED[/green]")
+        console.print(
+            f"[bold green]v[/bold green] Connected to profile: "
+            f"[bold cyan]{result.profile_name}[/bold cyan]"
+        )
+        console.print("  Schema validation: [green]PASSED[/green]")
         if result.schema_report and result.schema_report.extra_tables:
-            console.print(f"  Extra tables: [yellow]{', '.join(result.schema_report.extra_tables)}[/yellow]")
+            console.print(
+                f"  Extra tables: [yellow]"
+                f"{', '.join(result.schema_report.extra_tables)}[/yellow]"
+            )
 
-        # Show data comparison if switching profiles
+        # Show profile switch notice
         if previous_profile and previous_profile != result.profile_name:
-            _show_profile_comparison(previous_profile, result.profile_name)
-        elif not previous_profile:
-            # First connection - show current profile data
-            _show_profile_data(result.profile_name)
+            console.print(
+                f"\n[dim]Switched from[/dim] [bold]{previous_profile}[/bold] "
+                f"[dim]to[/dim] [bold cyan]{result.profile_name}[/bold cyan]"
+            )
 
         return 0
     else:
         console.print()
-        console.print(f"[bold red]✗[/bold red] {result.error}")
+        console.print(f"[bold red]x[/bold red] {result.error}")
 
         if result.schema_report:
             console.print("\n[bold]Schema validation report:[/bold]")
@@ -85,124 +169,449 @@ def cmd_connect(args: argparse.Namespace) -> int:
         return 1
 
 
-def _show_profile_comparison(previous_profile: str, current_profile: str) -> None:
-    """Show data comparison between two profiles.
+async def _async_validate(args: argparse.Namespace) -> int:
+    """Async implementation for validate command.
 
     Args:
-        previous_profile: Profile we switched from
-        current_profile: Profile we switched to
+        args: Parsed arguments with env_prefix.
+
+    Returns:
+        0 on valid schema, 1 on invalid or no profile.
     """
-    console.print()
-    console.print(
-        Panel(
-            f"[bold]{previous_profile}[/bold] → [bold cyan]{current_profile}[/bold cyan]",
-            title="Profile Switch",
-            border_style="cyan",
+    env_prefix = getattr(args, "env_prefix", "")
+
+    profile = read_profile_lock()
+
+    if not profile:
+        console.print("[yellow]No validated profile.[/yellow]")
+        console.print(
+            "[dim]Run[/dim] [cyan]db-adapter connect[/cyan] [dim]first.[/dim]"
         )
+        return 1
+
+    console.print(
+        f"Validating schema for profile: [bold cyan]{profile}[/bold cyan]"
     )
 
-    comparison = compare_profiles(previous_profile, current_profile)
-    if comparison.success:
-        # Create comparison table
-        table = Table(show_header=True, header_style="bold")
-        table.add_column("", style="dim")
-        table.add_column(previous_profile, justify="right")
-        table.add_column(current_profile, justify="right")
-        table.add_column("Δ", justify="right")
+    result = await connect_and_validate(
+        profile_name=profile, env_prefix=env_prefix
+    )
 
-        for entity in ["projects", "milestones", "tasks"]:
-            prev_count = comparison.source_counts[entity]
-            curr_count = comparison.dest_counts[entity]
-            diff = curr_count - prev_count
-
-            if diff > 0:
-                diff_str = f"[green]+{diff}[/green]"
-            elif diff < 0:
-                diff_str = f"[red]{diff}[/red]"
-            else:
-                diff_str = "[dim]=[/dim]"
-
-            table.add_row(
-                entity.capitalize(),
-                str(prev_count),
-                str(curr_count),
-                diff_str,
-            )
-
-        console.print(table)
-
-        # Show sync hint if data differs
-        total_prev = sum(comparison.source_counts.values())
-        total_curr = sum(comparison.dest_counts.values())
-        if total_prev != total_curr:
-            console.print()
+    if result.schema_valid:
+        console.print()
+        console.print("[bold green]v[/bold green] Schema is valid")
+        if result.schema_report and result.schema_report.extra_tables:
             console.print(
-                f"[dim]Hint: Use[/dim] [cyan]python -m schema sync --from {previous_profile} --dry-run[/cyan] [dim]to preview sync.[/dim]"
+                f"  Extra tables: [yellow]"
+                f"{', '.join(result.schema_report.extra_tables)}[/yellow]"
             )
+        return 0
     else:
-        console.print(f"[yellow]Could not compare profiles: {comparison.error}[/yellow]")
+        console.print()
+        console.print("[bold red]x[/bold red] Schema has drifted")
+        if result.schema_report:
+            console.print(result.schema_report.format_report())
+        return 1
 
 
-def _show_profile_data(profile_name: str) -> None:
-    """Show data counts for a single profile.
+async def _async_fix(args: argparse.Namespace) -> int:
+    """Async implementation for fix command.
+
+    Uses ``--schema-file`` to parse expected columns and CREATE TABLE SQL,
+    and ``--column-defs`` for ALTER TABLE column type definitions.
+    Delegates FK ordering to ``FixPlan.drop_order``/``create_order``.
 
     Args:
-        profile_name: Profile to show data for
+        args: Parsed arguments with schema_file, column_defs, confirm,
+            no_backup, and env_prefix.
+
+    Returns:
+        0 on success, 1 on failure.
     """
-    from adapters import PostgresAdapter
+    from db_adapter.schema.fix import generate_fix_plan, apply_fixes
+
+    env_prefix = getattr(args, "env_prefix", "")
+
+    # Resolve profile
+    try:
+        profile = get_active_profile_name(env_prefix=env_prefix)
+    except ProfileNotFoundError:
+        console.print("[yellow]No profile configured.[/yellow]")
+        console.print(
+            "[dim]Run[/dim] [cyan]DB_PROFILE=<name> db-adapter fix "
+            "--schema-file schema.sql --column-defs defs.json[/cyan]"
+        )
+        return 1
+
+    console.print(
+        f"Analyzing schema for profile: [bold cyan]{profile}[/bold cyan]"
+    )
+
+    # Parse expected columns from schema file
+    try:
+        expected_columns = _parse_expected_columns(args.schema_file)
+    except (FileNotFoundError, ValueError) as e:
+        console.print(f"\n[red]Error: {e}[/red]")
+        return 1
+
+    # Load column definitions from JSON
+    try:
+        col_defs_path = Path(args.column_defs)
+        column_definitions: dict[str, str] = json.loads(
+            col_defs_path.read_text()
+        )
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        console.print(f"\n[red]Error reading column definitions: {e}[/red]")
+        return 1
+
+    # Connect and validate to get schema report
+    result = await connect_and_validate(
+        profile_name=profile,
+        expected_columns=expected_columns,
+        env_prefix=env_prefix,
+        validate_only=True,
+    )
+
+    if result.schema_valid:
+        console.print()
+        console.print(
+            "[bold green]v[/bold green] Schema is valid - no fixes needed"
+        )
+        return 0
+
+    if not result.schema_report:
+        console.print(f"\n[red]Error: {result.error}[/red]")
+        return 1
+
+    # Generate fix plan using the new signature
+    plan = generate_fix_plan(
+        result.schema_report, column_definitions, args.schema_file
+    )
+
+    if plan.error:
+        console.print(f"\n[red]Error: {plan.error}[/red]")
+        return 1
+
+    if not plan.has_fixes:
+        console.print()
+        console.print(
+            "[bold green]v[/bold green] Schema is valid - no fixes needed"
+        )
+        return 0
+
+    # Show schema differences
+    console.print()
+    diff_table = Table(
+        title="Schema Differences", show_header=True, header_style="bold"
+    )
+    diff_table.add_column("Table", style="dim")
+    diff_table.add_column("Column")
+    diff_table.add_column("Type")
+
+    for table_fix in plan.missing_tables:
+        diff_table.add_row(
+            table_fix.table,
+            "[bold green]NEW TABLE[/bold green]",
+            "",
+        )
+
+    for table_fix in plan.tables_to_recreate:
+        diff_table.add_row(
+            table_fix.table,
+            "[bold yellow]RECREATE[/bold yellow]",
+            "",
+        )
+
+    for col_fix in plan.missing_columns:
+        type_display = col_fix.definition.split()[0]
+        if "REFERENCES" in col_fix.definition:
+            type_display += " (FK)"
+        diff_table.add_row(col_fix.table, col_fix.column, type_display)
+
+    console.print(diff_table)
+
+    # Show execution plan using FixPlan's topological ordering
+    console.print()
+    console.print("[bold]Execution Plan:[/bold]")
+    step = 1
+
+    if not args.no_backup:
+        console.print(f"  {step}. Backup [cyan]{profile}[/cyan] database")
+        step += 1
+
+    if plan.missing_tables:
+        for t_name in plan.create_order:
+            if any(tf.table == t_name for tf in plan.missing_tables):
+                console.print(
+                    f"  {step}. CREATE TABLE [cyan]{t_name}[/cyan]"
+                )
+                step += 1
+        # Tables not in create_order
+        for tf in plan.missing_tables:
+            if tf.table not in plan.create_order:
+                console.print(
+                    f"  {step}. CREATE TABLE [cyan]{tf.table}[/cyan]"
+                )
+                step += 1
+
+    if plan.tables_to_recreate:
+        drop_names = [
+            t for t in plan.drop_order
+            if any(tf.table == t for tf in plan.tables_to_recreate)
+        ]
+        # Tables not in drop_order
+        for tf in plan.tables_to_recreate:
+            if tf.table not in drop_names:
+                drop_names.append(tf.table)
+
+        console.print(
+            f"  {step}. DROP TABLES [cyan]{', '.join(drop_names)}[/cyan]"
+        )
+        step += 1
+
+        create_names = [
+            t for t in plan.create_order
+            if any(tf.table == t for tf in plan.tables_to_recreate)
+        ]
+        for tf in plan.tables_to_recreate:
+            if tf.table not in create_names:
+                create_names.append(tf.table)
+
+        for t_name in create_names:
+            console.print(
+                f"  {step}. CREATE TABLE [cyan]{t_name}[/cyan]"
+            )
+            step += 1
+
+    if plan.missing_columns:
+        for c in plan.missing_columns:
+            console.print(
+                f"  {step}. ALTER TABLE [cyan]{c.table}[/cyan] "
+                f"ADD COLUMN {c.column}"
+            )
+            step += 1
+
+    if not args.confirm:
+        console.print()
+        console.print(
+            "[dim]To apply fixes, add[/dim] [cyan]--confirm[/cyan] "
+            "[dim]flag.[/dim]"
+        )
+        return 0
+
+    # Apply fixes via the async apply_fixes() function
+    console.print()
+    console.print("[bold]Applying fixes...[/bold]")
+
+    from db_adapter.factory import get_adapter
 
     try:
-        config = load_db_config()
-        if profile_name not in config.profiles:
-            return
+        adapter = await get_adapter(
+            profile_name=profile, env_prefix=env_prefix
+        )
+    except Exception as e:
+        console.print(
+            f"\n[bold red]Error:[/bold red] Connection failed: {e}"
+        )
+        return 1
 
-        url = _resolve_url(config.profiles[profile_name])
-        adapter = PostgresAdapter(database_url=url)
-        user_id = get_dev_user_id()
+    fix_result = await apply_fixes(
+        adapter,
+        plan,
+        dry_run=False,
+        confirm=True,
+    )
 
-        counts = {}
-        for table in ["projects", "milestones", "tasks"]:
-            result = adapter.select(table, "count(*) as cnt", filters={"user_id": user_id})
-            counts[table] = result[0]["cnt"] if result else 0
-
-        adapter.close()
-
+    if fix_result.success:
         console.print()
-        table = Table(title="Database Data", show_header=True, header_style="bold")
-        table.add_column("Entity", style="dim")
-        table.add_column("Count", justify="right")
+        console.print("[bold green]v Schema fix complete![/bold green]")
+        if fix_result.tables_created:
+            console.print(
+                f"  Tables created: {fix_result.tables_created}"
+            )
+        if fix_result.tables_recreated:
+            console.print(
+                f"  Tables recreated: {fix_result.tables_recreated}"
+            )
+        if fix_result.columns_added:
+            console.print(
+                f"  Columns added: {fix_result.columns_added}"
+            )
+        return 0
+    else:
+        console.print(
+            f"\n[bold red]x[/bold red] Fix failed: {fix_result.error}"
+        )
+        return 1
 
-        for entity in ["projects", "milestones", "tasks"]:
-            table.add_row(entity.capitalize(), str(counts[entity]))
 
-        console.print(table)
+async def _async_sync(args: argparse.Namespace) -> int:
+    """Async implementation for sync command.
 
-    except Exception:
-        # Silently ignore errors showing data - connection is already validated
-        pass
+    Accepts ``--tables`` (comma-separated) and ``--user-id`` arguments,
+    forwarded to ``compare_profiles()`` and ``sync_data()``.
+
+    Args:
+        args: Parsed arguments with source, tables, user_id, dry_run,
+            confirm, and env_prefix.
+
+    Returns:
+        0 on success, 1 on failure.
+    """
+    env_prefix = getattr(args, "env_prefix", "")
+    source = args.source
+    tables = [t.strip() for t in args.tables.split(",")]
+    user_id = args.user_id
+
+    # Get destination (current profile)
+    dest = read_profile_lock()
+    if not dest:
+        try:
+            dest = get_active_profile_name(env_prefix=env_prefix)
+        except ProfileNotFoundError:
+            console.print(
+                "[red]Error: No destination profile configured.[/red]"
+            )
+            console.print(
+                "[dim]Run:[/dim] [cyan]DB_PROFILE=<name> db-adapter "
+                "connect[/cyan]"
+            )
+            return 1
+
+    if source == dest:
+        console.print(
+            f"[red]Error: Source and destination are the same profile: "
+            f"{source}[/red]"
+        )
+        return 1
+
+    console.print("Comparing profiles...", style="dim")
+    console.print(f"  Source: [bold]{source}[/bold]")
+    console.print(f"  Destination: [bold cyan]{dest}[/bold cyan]")
+    console.print(f"  Tables: [dim]{', '.join(tables)}[/dim]")
+
+    # Compare profiles
+    result = await compare_profiles(
+        source, dest, tables=tables, user_id=user_id, env_prefix=env_prefix
+    )
+
+    if not result.success:
+        console.print(f"\n[red]Error: {result.error}[/red]")
+        return 1
+
+    # Show comparison table
+    console.print()
+    comp_table = Table(
+        title="Data Comparison", show_header=True, header_style="bold"
+    )
+    comp_table.add_column("", style="dim")
+    comp_table.add_column(f"{source} (source)", justify="right")
+    comp_table.add_column(f"{dest} (dest)", justify="right")
+
+    for tbl in tables:
+        comp_table.add_row(
+            tbl,
+            str(result.source_counts.get(tbl, 0)),
+            str(result.dest_counts.get(tbl, 0)),
+        )
+
+    console.print(comp_table)
+
+    # Show sync plan
+    if result.sync_plan:
+        console.print()
+        plan_table = Table(
+            title="Sync Plan", show_header=True, header_style="bold"
+        )
+        plan_table.add_column("Table", style="dim")
+        plan_table.add_column("New", justify="right", style="green")
+        plan_table.add_column("Update", justify="right", style="yellow")
+
+        for table_name, plan in result.sync_plan.items():
+            plan_table.add_row(
+                table_name,
+                str(plan["new"]) if plan["new"] > 0 else "-",
+                str(plan["update"]) if plan["update"] > 0 else "-",
+            )
+
+        console.print(plan_table)
+        console.print("[dim]Source overwrites on collision.[/dim]")
+
+    if args.dry_run:
+        console.print()
+        console.print("[bold yellow]DRY RUN[/bold yellow] - No changes made.")
+        return 0
+
+    if not args.confirm:
+        console.print()
+        console.print(
+            "[dim]To actually sync, add[/dim] [cyan]--confirm[/cyan] "
+            "[dim]flag.[/dim]"
+        )
+        return 0
+
+    console.print()
+    console.print("Syncing data...", style="dim")
+    sync_result = await sync_data(
+        source,
+        dest,
+        tables=tables,
+        user_id=user_id,
+        env_prefix=env_prefix,
+        dry_run=False,
+        confirm=True,
+    )
+
+    if sync_result.success:
+        console.print("[bold green]v[/bold green] Sync complete.")
+        return 0
+    else:
+        console.print(f"[bold red]x[/bold red] {sync_result.error}")
+        return 1
+
+
+# ============================================================================
+# Sync command wrappers (cmd_status, cmd_profiles read local files only)
+# ============================================================================
+
+
+def cmd_connect(args: argparse.Namespace) -> int:
+    """Connect to database and validate schema.
+
+    Wraps the async implementation with ``asyncio.run()``.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        0 on success, 1 on failure.
+    """
+    return asyncio.run(_async_connect(args))
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     """Show current connection status.
 
-    Displays the currently validated profile from .db-profile lock file,
-    or indicates no profile is configured.
+    Reads only local files (lock file and TOML config) -- no database calls.
+
+    Args:
+        args: Parsed CLI arguments.
 
     Returns:
-        0 always (informational command)
+        0 always (informational command).
     """
     profile = read_profile_lock()
 
     if profile:
-        # Profile info table
         table = Table(title="Connection Status", show_header=False)
         table.add_column("Key", style="dim")
         table.add_column("Value")
 
-        table.add_row("Current profile", f"[bold cyan]{profile}[/bold cyan]")
+        table.add_row(
+            "Current profile", f"[bold cyan]{profile}[/bold cyan]"
+        )
         table.add_row("Profile source", ".db-profile (validated)")
 
-        # Show profile details
         try:
             config = load_db_config()
             if profile in config.profiles:
@@ -214,12 +623,11 @@ def cmd_status(args: argparse.Namespace) -> int:
             table.add_row("Warning", "[yellow]db.toml not found[/yellow]")
 
         console.print(table)
-
-        # Show data counts
-        _show_profile_data(profile)
     else:
         console.print("[yellow]No validated profile.[/yellow]")
-        console.print("[dim]Run:[/dim] [cyan]MC_DB_PROFILE=<name> python -m schema connect[/cyan]")
+        console.print(
+            "[dim]Run:[/dim] [cyan]DB_PROFILE=<name> db-adapter connect[/cyan]"
+        )
 
     return 0
 
@@ -227,11 +635,13 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_profiles(args: argparse.Namespace) -> int:
     """List available profiles from db.toml.
 
-    Shows all configured profiles with their details.
-    Marks the current profile with an asterisk (*).
+    Reads only local TOML config -- no database calls.
+
+    Args:
+        args: Parsed CLI arguments.
 
     Returns:
-        0 on success, 1 if db.toml not found
+        0 on success, 1 if db.toml not found.
     """
     try:
         config = load_db_config()
@@ -241,14 +651,16 @@ def cmd_profiles(args: argparse.Namespace) -> int:
 
     current = read_profile_lock()
 
-    table = Table(title="Database Profiles", show_header=True, header_style="bold")
+    table = Table(
+        title="Database Profiles", show_header=True, header_style="bold"
+    )
     table.add_column("", width=2)
     table.add_column("Profile")
     table.add_column("Provider")
     table.add_column("Description")
 
     for name, profile in config.profiles.items():
-        marker = "[bold green]●[/bold green]" if name == current else " "
+        marker = "[bold green]*[/bold green]" if name == current else " "
         name_style = "bold cyan" if name == current else ""
         table.add_row(
             marker,
@@ -260,7 +672,7 @@ def cmd_profiles(args: argparse.Namespace) -> int:
     console.print(table)
 
     if current:
-        console.print(f"\n[bold green]●[/bold green] = current profile")
+        console.print(f"\n[bold green]*[/bold green] = current profile")
 
     return 0
 
@@ -268,385 +680,48 @@ def cmd_profiles(args: argparse.Namespace) -> int:
 def cmd_validate(args: argparse.Namespace) -> int:
     """Re-validate current profile schema.
 
-    Validates the schema of the currently locked profile without
-    changing the lock file.
-
-    Returns:
-        0 on valid schema, 1 on invalid or no profile
-    """
-    profile = read_profile_lock()
-
-    if not profile:
-        console.print("[yellow]No validated profile.[/yellow]")
-        console.print("[dim]Run[/dim] [cyan]python -m schema connect[/cyan] [dim]first.[/dim]")
-        return 1
-
-    console.print(f"Validating schema for profile: [bold cyan]{profile}[/bold cyan]")
-
-    result = connect_and_validate(profile_name=profile)
-
-    if result.schema_valid:
-        console.print()
-        console.print("[bold green]✓[/bold green] Schema is valid")
-        if result.schema_report and result.schema_report.extra_tables:
-            console.print(f"  Extra tables: [yellow]{', '.join(result.schema_report.extra_tables)}[/yellow]")
-        return 0
-    else:
-        console.print()
-        console.print("[bold red]✗[/bold red] Schema has drifted")
-        if result.schema_report:
-            console.print(result.schema_report.format_report())
-        return 1
-
-
-def cmd_sync(args: argparse.Namespace) -> int:
-    """Sync data from source profile to current profile.
-
-    Uses backup/restore infrastructure to copy data from source to destination.
-    Records are matched by slug; source data takes precedence on collision.
+    Wraps the async implementation with ``asyncio.run()``.
 
     Args:
-        args: Parsed arguments with source, dry_run, and confirm flags
+        args: Parsed CLI arguments.
 
     Returns:
-        0 on success, 1 on failure
+        0 on valid schema, 1 on invalid or no profile.
     """
-    source = args.source
-
-    # Get destination (current profile)
-    dest = read_profile_lock()
-    if not dest:
-        try:
-            dest = get_active_profile_name()
-        except ProfileNotFoundError:
-            console.print("[red]Error: No destination profile configured.[/red]")
-            console.print("[dim]Run:[/dim] [cyan]MC_DB_PROFILE=<name> python -m schema connect[/cyan]")
-            return 1
-
-    if source == dest:
-        console.print(f"[red]Error: Source and destination are the same profile: {source}[/red]")
-        return 1
-
-    console.print("Comparing profiles...", style="dim")
-    console.print(f"  Source: [bold]{source}[/bold]")
-    console.print(f"  Destination: [bold cyan]{dest}[/bold cyan]")
-
-    # Compare profiles
-    result = compare_profiles(source, dest)
-
-    if not result.success:
-        console.print(f"\n[red]Error: {result.error}[/red]")
-        return 1
-
-    # Show comparison table
-    console.print()
-    table = Table(title="Data Comparison", show_header=True, header_style="bold")
-    table.add_column("", style="dim")
-    table.add_column(f"{source} (source)", justify="right")
-    table.add_column(f"{dest} (dest)", justify="right")
-
-    for entity in ["projects", "milestones", "tasks"]:
-        table.add_row(
-            entity.capitalize(),
-            str(result.source_counts[entity]),
-            str(result.dest_counts[entity]),
-        )
-
-    console.print(table)
-
-    # Show sync plan
-    console.print()
-    plan_table = Table(title="Sync Plan", show_header=True, header_style="bold")
-    plan_table.add_column("Table", style="dim")
-    plan_table.add_column("New", justify="right", style="green")
-    plan_table.add_column("Update", justify="right", style="yellow")
-
-    for table_name, plan in result.sync_plan.items():
-        plan_table.add_row(
-            table_name,
-            str(plan["new"]) if plan["new"] > 0 else "-",
-            str(plan["update"]) if plan["update"] > 0 else "-",
-        )
-
-    console.print(plan_table)
-    console.print("[dim]Source overwrites on collision.[/dim]")
-
-    if args.dry_run:
-        console.print()
-        console.print("[bold yellow]DRY RUN[/bold yellow] - No changes made.")
-        return 0
-
-    if not args.confirm:
-        console.print()
-        console.print("[dim]To actually sync, add[/dim] [cyan]--confirm[/cyan] [dim]flag.[/dim]")
-        return 0
-
-    console.print()
-    console.print("Syncing data...", style="dim")
-    sync_result = sync_data(source, dest, dry_run=False, confirm=True)
-
-    if sync_result.success:
-        console.print("[bold green]✓[/bold green] Sync complete.")
-        return 0
-    else:
-        console.print(f"[bold red]✗[/bold red] {sync_result.error}")
-        return 1
+    return asyncio.run(_async_validate(args))
 
 
 def cmd_fix(args: argparse.Namespace) -> int:
     """Fix schema drift by adding missing tables and columns.
 
-    Backs up the database first, then applies ALTER TABLE statements.
+    Wraps the async implementation with ``asyncio.run()``.
 
     Args:
-        args: Parsed arguments with dry_run and confirm flags
+        args: Parsed CLI arguments.
 
     Returns:
-        0 on success, 1 on failure
+        0 on success, 1 on failure.
     """
-    from schema.fix import generate_fix_plan, apply_fixes
-
-    # Use MC_DB_PROFILE if set, otherwise fall back to lock file
-    try:
-        profile = get_active_profile_name()
-    except ProfileNotFoundError:
-        console.print("[yellow]No profile configured.[/yellow]")
-        console.print("[dim]Run[/dim] [cyan]MC_DB_PROFILE=<name> python -m schema fix --dry-run[/cyan]")
-        return 1
-
-    console.print(f"Analyzing schema for profile: [bold cyan]{profile}[/bold cyan]")
-
-    # Generate fix plan
-    plan = generate_fix_plan(profile)
-
-    if plan.error:
-        console.print(f"\n[red]Error: {plan.error}[/red]")
-        return 1
-
-    if not plan.has_fixes:
-        console.print()
-        console.print("[bold green]✓[/bold green] Schema is valid - no fixes needed")
-        return 0
-
-    # Show detailed column diff table
-    console.print()
-    table = Table(title="Schema Differences", show_header=True, header_style="bold")
-    table.add_column("Table", style="dim")
-    table.add_column("Column")
-    table.add_column("Type")
-
-    # Get all missing columns (including from tables to recreate)
-    from schema.fix import COLUMN_DEFINITIONS
-
-    for table_fix in plan.missing_tables:
-        table.add_row(
-            table_fix.table,
-            "[bold green]NEW TABLE[/bold green]",
-            "",
-        )
-
-    # For tables to recreate, show their missing columns
-    for table_fix in plan.tables_to_recreate:
-        result_check = connect_and_validate(profile_name=profile)
-        if result_check.schema_report:
-            for diff in result_check.schema_report.missing_columns:
-                if diff.table == table_fix.table:
-                    key = f"{diff.table}.{diff.column}"
-                    if key in COLUMN_DEFINITIONS:
-                        type_display = COLUMN_DEFINITIONS[key].split()[0]
-                        if "REFERENCES" in COLUMN_DEFINITIONS[key]:
-                            type_display += " (FK)"
-                        table.add_row(diff.table, diff.column, type_display)
-
-    # Single-column fixes
-    for col_fix in plan.missing_columns:
-        type_display = col_fix.definition.split()[0]
-        if "REFERENCES" in col_fix.definition:
-            type_display += " (FK)"
-        table.add_row(col_fix.table, col_fix.column, type_display)
-
-    console.print(table)
-
-    # Show execution plan (must match actual execution order)
-    console.print()
-    console.print("[bold]Execution Plan:[/bold]")
-    step = 1
-
-    # FK order for display
-    fk_drop_order = {"tasks": 0, "milestones": 1, "projects": 2}
-    fk_create_order = {"projects": 0, "milestones": 1, "tasks": 2}
-
-    console.print(f"  {step}. Backup [cyan]{profile}[/cyan] database")
-    step += 1
-
-    if plan.missing_tables:
-        for t in plan.missing_tables:
-            console.print(f"  {step}. CREATE TABLE [cyan]{t.table}[/cyan]")
-            step += 1
-
-    if plan.tables_to_recreate:
-        # Show DROP all at once
-        sorted_drop = sorted(plan.tables_to_recreate, key=lambda t: fk_drop_order.get(t.table, 99))
-        drop_names = [t.table for t in sorted_drop]
-        console.print(f"  {step}. DROP TABLES [cyan]{', '.join(drop_names)}[/cyan]")
-        step += 1
-
-        # Show CREATE in correct order (projects first)
-        sorted_create = sorted(plan.tables_to_recreate, key=lambda t: fk_create_order.get(t.table, 99))
-        for t in sorted_create:
-            console.print(f"  {step}. CREATE TABLE [cyan]{t.table}[/cyan]")
-            step += 1
+    return asyncio.run(_async_fix(args))
 
 
-    if plan.missing_columns:
-        for c in plan.missing_columns:
-            console.print(f"  {step}. ALTER TABLE [cyan]{c.table}[/cyan] ADD COLUMN {c.column}")
-            step += 1
+def cmd_sync(args: argparse.Namespace) -> int:
+    """Sync data from source profile to current profile.
 
-    if not args.confirm:
-        console.print()
-        console.print("[dim]To apply fixes, add[/dim] [cyan]--confirm[/cyan] [dim]flag.[/dim]")
-        return 0
+    Wraps the async implementation with ``asyncio.run()``.
 
-    # Apply fixes step by step with progress
-    console.print()
-    console.print("[bold]Applying fixes...[/bold]")
+    Args:
+        args: Parsed CLI arguments.
 
-    from datetime import datetime
-    from pathlib import Path
-    import subprocess
-    import io
-    import sys
+    Returns:
+        0 on success, 1 on failure.
+    """
+    return asyncio.run(_async_sync(args))
 
-    from adapters import PostgresAdapter
-    from config import load_db_config
-    from db import _resolve_url
 
-    step = 1
-    backup_path = None
-
-    # Step 1: Backup (unless --no-backup)
-    if not args.no_backup:
-        try:
-            backup_dir = Path(__file__).parent.parent / "backup" / "backups"
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y-%m-%d-%H%M")
-            backup_path = backup_dir / f"pre-fix-{profile}-{timestamp}.json"
-
-            # Use subprocess to avoid connection conflicts
-            env = dict(os.environ)
-            env["MC_DB_PROFILE"] = profile
-            result = subprocess.run(
-                ["uv", "run", "python", "backup/backup_cli.py", "backup", "--output", str(backup_path)],
-                cwd=Path(__file__).parent.parent,
-                capture_output=True,
-                text=True,
-                env=env,
-            )
-            if result.returncode != 0:
-                raise Exception(result.stderr or "Backup failed")
-
-            console.print(f"  {step}. Backup [cyan]{profile}[/cyan] database [green]✓[/green]")
-            console.print(f"     [dim]{backup_path}[/dim]")
-        except Exception as e:
-            console.print(f"  {step}. Backup [cyan]{profile}[/cyan] database [red]✗[/red]")
-            console.print(f"     [bold red]Error:[/bold red] {e}")
-            return 1
-        step += 1
-    elif plan.tables_to_recreate:
-        console.print("[bold yellow]Warning:[/bold yellow] --no-backup with table recreation - data may be lost!")
-        console.print("[dim]Proceeding without backup...[/dim]")
-
-    # Get database connection
-    try:
-        config = load_db_config()
-        url = _resolve_url(config.profiles[profile])
-        adapter = PostgresAdapter(database_url=url)
-    except Exception as e:
-        console.print(f"\n[bold red]Error:[/bold red] Connection failed: {e}")
-        return 1
-
-    # Step 2+: Create new tables
-    for table_fix in plan.missing_tables:
-        try:
-            with adapter._conn.cursor() as cur:
-                cur.execute(table_fix.to_sql())
-            adapter._conn.commit()
-            console.print(f"  {step}. CREATE TABLE [cyan]{table_fix.table}[/cyan] [green]✓[/green]")
-        except Exception as e:
-            console.print(f"  {step}. CREATE TABLE [cyan]{table_fix.table}[/cyan] [red]✗[/red]")
-            console.print(f"     [bold red]Error:[/bold red] {e}")
-            adapter.close()
-            return 1
-        step += 1
-
-    # Step 3+: Recreate tables - DROP all first, then CREATE all
-    # FK order for DROP: tasks → milestones → projects (reverse)
-    # FK order for CREATE: projects → milestones → tasks (forward)
-    fk_drop_order = {"tasks": 0, "milestones": 1, "projects": 2}
-    fk_create_order = {"projects": 0, "milestones": 1, "tasks": 2}
-
-    if plan.tables_to_recreate:
-        # DROP all tables at once (faster, avoids FK issues)
-        sorted_for_drop = sorted(plan.tables_to_recreate, key=lambda t: fk_drop_order.get(t.table, 99))
-        drop_tables = [t.table for t in sorted_for_drop]
-        drop_sql = "; ".join([f"DROP TABLE IF EXISTS {t} CASCADE" for t in drop_tables])
-
-        try:
-            with adapter._conn.cursor() as cur:
-                cur.execute(drop_sql)
-            adapter._conn.commit()
-            console.print(f"  {step}. DROP TABLES [cyan]{', '.join(drop_tables)}[/cyan] [green]✓[/green]")
-        except Exception as e:
-            console.print(f"  {step}. DROP TABLES [cyan]{', '.join(drop_tables)}[/cyan] [red]✗[/red]")
-            console.print(f"     [bold red]Error:[/bold red] {e}")
-            adapter.close()
-            return 1
-        step += 1
-
-        # CREATE all tables in correct FK order
-        sorted_for_create = sorted(plan.tables_to_recreate, key=lambda t: fk_create_order.get(t.table, 99))
-        for table_fix in sorted_for_create:
-            try:
-                with adapter._conn.cursor() as cur:
-                    cur.execute(table_fix.to_sql())
-                adapter._conn.commit()
-                console.print(f"  {step}. CREATE TABLE [cyan]{table_fix.table}[/cyan] [green]✓[/green]")
-            except Exception as e:
-                console.print(f"  {step}. CREATE TABLE [cyan]{table_fix.table}[/cyan] [red]✗[/red]")
-                console.print(f"     [bold red]Error:[/bold red] {e}")
-                adapter.close()
-                return 1
-            step += 1
-
-    # Step 4+: Add single columns
-    for col_fix in plan.missing_columns:
-        try:
-            with adapter._conn.cursor() as cur:
-                cur.execute(col_fix.to_sql())
-            adapter._conn.commit()
-            console.print(f"  {step}. ALTER TABLE [cyan]{col_fix.table}[/cyan] ADD {col_fix.column} [green]✓[/green]")
-        except Exception as e:
-            console.print(f"  {step}. ALTER TABLE [cyan]{col_fix.table}[/cyan] ADD {col_fix.column} [red]✗[/red]")
-            console.print(f"     [bold red]Error:[/bold red] {e}")
-            adapter.close()
-            return 1
-        step += 1
-
-    adapter.close()
-
-    # Verify (validate_only=True to not write lock file)
-    verify_result = connect_and_validate(profile_name=profile, validate_only=True)
-    if verify_result.success:
-        console.print(f"  {step}. Verify schema [green]✓[/green]")
-    else:
-        console.print(f"  {step}. Verify schema [yellow]![/yellow]")
-        console.print(f"     [yellow]Warning: {verify_result.error}[/yellow]")
-
-    console.print()
-    console.print("[bold green]✓ Schema fix complete![/bold green]")
-
-    return 0
+# ============================================================================
+# Main entry point
+# ============================================================================
 
 
 def main() -> int:
@@ -655,11 +730,21 @@ def main() -> int:
     Parses command line arguments and dispatches to appropriate handler.
 
     Returns:
-        Exit code (0 for success, non-zero for errors)
+        Exit code (0 for success, non-zero for errors).
     """
     parser = argparse.ArgumentParser(
-        prog="python -m schema",
-        description="Database schema management for Mission Control",
+        prog="db-adapter",
+        description="Database schema management and adapter toolkit",
+    )
+
+    # Global option: --env-prefix
+    parser.add_argument(
+        "--env-prefix",
+        default="",
+        help=(
+            "Prefix for environment variable lookup "
+            "(e.g., --env-prefix APP_ reads APP_DB_PROFILE)"
+        ),
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -705,6 +790,16 @@ def main() -> int:
         help="Source profile to sync from",
     )
     p_sync.add_argument(
+        "--tables",
+        required=True,
+        help="Comma-separated list of tables to sync (e.g., projects,milestones,tasks)",
+    )
+    p_sync.add_argument(
+        "--user-id",
+        required=True,
+        help="User ID to filter records by",
+    )
+    p_sync.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what would be synced without making changes",
@@ -720,6 +815,16 @@ def main() -> int:
     p_fix = subparsers.add_parser(
         "fix",
         help="Fix schema drift by adding missing tables and columns",
+    )
+    p_fix.add_argument(
+        "--schema-file",
+        required=True,
+        help="Path to SQL file containing CREATE TABLE statements",
+    )
+    p_fix.add_argument(
+        "--column-defs",
+        required=True,
+        help='Path to JSON file mapping "table.column" to SQL type definition',
     )
     p_fix.add_argument(
         "--confirm",

@@ -3,7 +3,7 @@
 **Vision**: A standalone, async-first Python library providing dict-based CRUD over PostgreSQL with Protocol typing, multi-profile config, schema management, and backup/restore — installable by any Python 3.12+ project.
 
 **Related Documents**:
-- [Vision](./reference/db-adapter-vision.md)
+- [Vision](./db-adapter-vision.md)
 - [Architecture](./db-adapter-architecture.md)
 
 **Strategic Approach**: Extract and decouple from MC → Async conversion + testing → First consumer validates API → PyPI publication for wider adoption

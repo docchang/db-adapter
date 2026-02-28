@@ -1,18 +1,18 @@
 """Backup schema models for declarative table hierarchy.
 
-Projects declare their table structure, FK relationships, and
-the backup/restore engine handles ID remapping automatically.
+Consuming applications declare their table structure, FK relationships,
+and the backup/restore engine handles ID remapping automatically.
 
 Usage:
     from db_adapter.backup.models import BackupSchema, TableDef, ForeignKey
 
     schema = BackupSchema(tables=[
-        TableDef("projects", pk="id", slug_field="slug", user_field="user_id"),
-        TableDef("milestones", pk="id", slug_field="slug", user_field="user_id",
-                 parent=ForeignKey(table="projects", field="project_id")),
-        TableDef("tasks", pk="id", slug_field="slug", user_field="user_id",
-                 parent=ForeignKey(table="projects", field="project_id"),
-                 optional_refs=[ForeignKey(table="milestones", field="milestone_id")]),
+        TableDef(name="authors", pk="id", slug_field="slug", user_field="user_id"),
+        TableDef(name="books", pk="id", slug_field="slug", user_field="user_id",
+                 parent=ForeignKey(table="authors", field="author_id")),
+        TableDef(name="chapters", pk="id", slug_field="slug", user_field="user_id",
+                 parent=ForeignKey(table="books", field="book_id"),
+                 optional_refs=[ForeignKey(table="authors", field="editor_id")]),
     ])
 """
 

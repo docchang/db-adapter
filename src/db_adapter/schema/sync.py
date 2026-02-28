@@ -1,240 +1,376 @@
-"""Data sync between database profiles.
+"""Data sync between database profiles (async).
 
 Provides functionality to compare and sync data between different database
-profiles (e.g., RDS to local, Supabase to RDS).
+profiles (e.g., RDS to local, Supabase to RDS).  All operations are async.
 
-Uses existing backup/restore infrastructure for cross-profile data migration.
-Sync is slug-based: records are matched by slug, not by ID.
+Sync is slug-based: records are matched by slug, not by ID.  Supports two
+sync paths:
+
+1. **Direct insert** (``schema=None``): Simple per-table select/insert with
+   slug-based matching.  No FK remapping.  Best for flat tables.
+2. **Backup/restore** (``schema`` provided): FK-aware sync via
+   ``backup_database()``/``restore_database()`` with ID remapping.  Required
+   when tables have parent-child FK relationships.
 
 Usage:
-    from schema.sync import compare_profiles, sync_data, SyncResult
+    from db_adapter.schema.sync import compare_profiles, sync_data, SyncResult
 
     # Compare what would be synced
-    result = compare_profiles("rds", "local")
-    print(f"Source projects: {result.source_counts['projects']}")
+    result = await compare_profiles(
+        "rds", "local",
+        tables=["authors", "books"],
+        user_id="user-1",
+    )
 
-    # Perform sync (dry run first)
-    result = sync_data("rds", "local", dry_run=True)
+    # Perform direct sync (dry run first)
+    result = await sync_data(
+        "rds", "local",
+        tables=["authors", "books"],
+        user_id="user-1",
+        dry_run=True,
+    )
 
-    # Actually sync
-    result = sync_data("rds", "local", dry_run=False, confirm=True)
+    # FK-aware sync with BackupSchema
+    from db_adapter.backup.models import BackupSchema, TableDef, ForeignKey
+    schema = BackupSchema(tables=[
+        TableDef(name="authors", pk="id"),
+        TableDef(name="books", pk="id",
+                 parent=ForeignKey(table="authors", field="author_id")),
+    ])
+    result = await sync_data(
+        "rds", "local",
+        tables=["authors", "books"],
+        user_id="user-1",
+        schema=schema,
+        dry_run=False,
+        confirm=True,
+    )
 """
 
-from typing import TYPE_CHECKING
+from __future__ import annotations
+
+import tempfile
+from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field
 
-# Avoid circular imports - these are imported at runtime in functions
-if TYPE_CHECKING:
-    from adapters import PostgresAdapter
-    from schema.models import DatabaseProfile
+from db_adapter.adapters.base import DatabaseClient
+from db_adapter.backup.models import BackupSchema
 
 
 class SyncResult(BaseModel):
     """Result of sync comparison or operation.
 
+    All dict fields use dynamic table names provided by the caller -- no
+    hardcoded defaults.
+
     Attributes:
-        success: Whether the operation completed successfully
-        source_profile: Name of source profile
-        dest_profile: Name of destination profile
-        source_counts: Record counts in source database
-        dest_counts: Record counts in destination database
-        sync_plan: What would be synced (new vs update)
-        error: Error message if operation failed
+        success: Whether the operation completed successfully.
+        source_profile: Name of source profile.
+        dest_profile: Name of destination profile.
+        source_counts: Record counts per table in source database.
+        dest_counts: Record counts per table in destination database.
+        sync_plan: Per-table plan with ``new`` and ``update`` counts.
+        synced_count: Total records synced (inserted or updated).
+        skipped_count: Total records skipped (already existed in dest).
+        errors: List of error messages encountered during sync.
     """
 
     success: bool = False
     source_profile: str = ""
     dest_profile: str = ""
-    source_counts: dict[str, int] = Field(
-        default_factory=lambda: {"projects": 0, "milestones": 0, "tasks": 0}
-    )
-    dest_counts: dict[str, int] = Field(
-        default_factory=lambda: {"projects": 0, "milestones": 0, "tasks": 0}
-    )
-    sync_plan: dict[str, dict[str, int]] = Field(
-        default_factory=lambda: {
-            "projects": {"new": 0, "update": 0},
-            "milestones": {"new": 0, "update": 0},
-            "tasks": {"new": 0, "update": 0},
-        }
-    )
-    error: str | None = None
+    source_counts: dict[str, int] = Field(default_factory=dict)
+    dest_counts: dict[str, int] = Field(default_factory=dict)
+    sync_plan: dict[str, dict[str, int]] = Field(default_factory=dict)
+    synced_count: int = 0
+    skipped_count: int = 0
+    errors: list[str] = Field(default_factory=list)
 
 
-def _get_data_counts(adapter: "PostgresAdapter", user_id: str) -> dict[str, int]:
-    """Get record counts from database.
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+async def _get_data_counts(
+    adapter: DatabaseClient,
+    user_id: str,
+    tables: list[str],
+    user_field: str,
+) -> dict[str, int]:
+    """Get record counts from database for given tables.
 
     Args:
-        adapter: Database adapter
-        user_id: User ID to filter by
+        adapter: Database adapter.
+        user_id: User ID to filter by.
+        tables: List of table names to count.
+        user_field: Column name for user ownership filtering.
 
     Returns:
-        Dict mapping table name to record count
+        Dict mapping table name to record count.
     """
-    counts = {}
-    for table in ["projects", "milestones", "tasks"]:
-        result = adapter.select(table, "count(*) as cnt", filters={"user_id": user_id})
-        counts[table] = result[0]["cnt"] if result else 0
-
+    counts: dict[str, int] = {}
+    for table in tables:
+        rows = await adapter.select(
+            table, "count(*) as cnt", filters={user_field: user_id}
+        )
+        counts[table] = rows[0]["cnt"] if rows else 0
     return counts
 
 
-def _get_slugs(adapter: "PostgresAdapter", user_id: str) -> dict[str, set[str]]:
-    """Get all slugs from database.
+async def _get_slugs(
+    adapter: DatabaseClient,
+    user_id: str,
+    tables: list[str],
+    slug_field: str,
+    user_field: str,
+) -> dict[str, set[str]]:
+    """Get all slugs from database using flat slug per table.
 
-    For milestones and tasks, returns "project_slug/slug" format for uniqueness.
+    Each table uses the same ``slug_field`` column name for matching.
+    No hierarchical project_slug/slug composition -- just flat slugs.
 
     Args:
-        adapter: Database adapter
-        user_id: User ID to filter by
+        adapter: Database adapter.
+        user_id: User ID to filter by.
+        tables: List of table names to query.
+        slug_field: Column name for slug lookup.
+        user_field: Column name for user ownership filtering.
 
     Returns:
-        Dict mapping table name to set of slugs
+        Dict mapping table name to set of slug values.
+
+    Note:
+        All tables passed must use the same ``slug_field`` column name.
+        If different slug column names are needed, callers should invoke
+        sync per-table group.
     """
     slugs: dict[str, set[str]] = {}
-
-    # Projects - simple slugs
-    projects = adapter.select("projects", "slug", filters={"user_id": user_id})
-    slugs["projects"] = {p["slug"] for p in projects}
-
-    # Build project_id -> slug mapping for milestones/tasks
-    all_projects = adapter.select("projects", "id, slug", filters={"user_id": user_id})
-    project_id_to_slug = {p["id"]: p["slug"] for p in all_projects}
-
-    # Milestones - need to include project slug for uniqueness
-    milestones = adapter.select(
-        "milestones", "project_id, slug", filters={"user_id": user_id}
-    )
-    slugs["milestones"] = set()
-    for m in milestones:
-        project_slug = project_id_to_slug.get(m["project_id"], "unknown")
-        slugs["milestones"].add(f"{project_slug}/{m['slug']}")
-
-    # Tasks - need to include project slug for uniqueness
-    tasks = adapter.select("tasks", "project_id, slug", filters={"user_id": user_id})
-    slugs["tasks"] = set()
-    for t in tasks:
-        project_slug = project_id_to_slug.get(t["project_id"], "unknown")
-        slugs["tasks"].add(f"{project_slug}/{t['slug']}")
-
+    for table in tables:
+        rows = await adapter.select(
+            table, slug_field, filters={user_field: user_id}
+        )
+        slugs[table] = {r[slug_field] for r in rows}
     return slugs
 
 
-def compare_profiles(source_profile: str, dest_profile: str) -> SyncResult:
+async def _create_adapter_for_profile(
+    profile_name: str,
+    env_prefix: str = "",
+) -> DatabaseClient:
+    """Create an ``AsyncPostgresAdapter`` for the given profile.
+
+    Uses ``load_db_config()`` and ``resolve_url()`` to resolve the profile
+    URL, then constructs an adapter.
+
+    Args:
+        profile_name: Profile name from db.toml.
+        env_prefix: Prefix for environment variable lookup.
+
+    Returns:
+        An ``AsyncPostgresAdapter`` instance.
+
+    Raises:
+        KeyError: If the profile is not found in db.toml.
+    """
+    from db_adapter.adapters.postgres import AsyncPostgresAdapter
+    from db_adapter.config.loader import load_db_config
+    from db_adapter.factory import resolve_url
+
+    config = load_db_config()
+    if profile_name not in config.profiles:
+        available = ", ".join(config.profiles.keys())
+        raise KeyError(
+            f"Profile '{profile_name}' not found in db.toml. "
+            f"Available: {available}"
+        )
+    profile = config.profiles[profile_name]
+    url = resolve_url(profile)
+    return AsyncPostgresAdapter(database_url=url)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+async def compare_profiles(
+    source_profile: str,
+    dest_profile: str,
+    tables: list[str],
+    user_id: str,
+    user_field: str = "user_id",
+    slug_field: str = "slug",
+    env_prefix: str = "",
+) -> SyncResult:
     """Compare data between two profiles.
 
     Compares by slug (not ID) to determine what would be synced.
     Records with same slug will be updated, new slugs will be inserted.
 
+    ``env_prefix`` is forwarded to ``get_active_profile_name()`` when
+    resolving the default profile for adapter creation (e.g.,
+    ``env_prefix="MC_"`` reads ``MC_DB_PROFILE``).
+
     Args:
-        source_profile: Source profile name from db.toml
-        dest_profile: Destination profile name from db.toml
+        source_profile: Source profile name from db.toml.
+        dest_profile: Destination profile name from db.toml.
+        tables: List of table names to compare.
+        user_id: User ID to filter by.
+        user_field: Column name for user ownership filtering.
+            Defaults to ``"user_id"``.
+        slug_field: Column name for slug-based matching.
+            Defaults to ``"slug"``.
+        env_prefix: Prefix for environment variable lookup.
+            Defaults to ``""`` (reads ``DB_PROFILE``).
 
     Returns:
-        SyncResult with counts and sync plan
+        ``SyncResult`` with counts and sync plan.
+
+    Example:
+        >>> result = await compare_profiles(
+        ...     "rds", "local",
+        ...     tables=["authors", "books"],
+        ...     user_id="user-1",
+        ... )
+        >>> print(result.source_counts)
+        {'authors': 5, 'books': 12}
     """
-    # Import at runtime to avoid circular imports
-    from adapters import PostgresAdapter
-    from config import load_db_config
-    from db import _resolve_url, get_dev_user_id
+    result = SyncResult(
+        source_profile=source_profile,
+        dest_profile=dest_profile,
+    )
 
-    result = SyncResult(source_profile=source_profile, dest_profile=dest_profile)
+    # Create adapters
+    source_adapter: DatabaseClient | None = None
+    dest_adapter: DatabaseClient | None = None
 
-    # Load config
     try:
-        config = load_db_config()
-    except FileNotFoundError as e:
-        result.error = str(e)
-        return result
-
-    # Validate profiles exist
-    if source_profile not in config.profiles:
-        result.error = f"Source profile '{source_profile}' not found. Available: {', '.join(config.profiles.keys())}"
-        return result
-    if dest_profile not in config.profiles:
-        result.error = f"Destination profile '{dest_profile}' not found. Available: {', '.join(config.profiles.keys())}"
-        return result
-
-    user_id = get_dev_user_id()
-
-    # Connect to source
-    try:
-        source_url = _resolve_url(config.profiles[source_profile])
-        source_adapter = PostgresAdapter(database_url=source_url)
+        source_adapter = await _create_adapter_for_profile(
+            source_profile, env_prefix
+        )
     except Exception as e:
-        result.error = f"Failed to connect to source profile '{source_profile}': {e}"
+        result.errors.append(
+            f"Failed to connect to source profile '{source_profile}': {e}"
+        )
         return result
 
-    # Connect to destination
     try:
-        dest_url = _resolve_url(config.profiles[dest_profile])
-        dest_adapter = PostgresAdapter(database_url=dest_url)
+        dest_adapter = await _create_adapter_for_profile(
+            dest_profile, env_prefix
+        )
     except Exception as e:
-        source_adapter.close()
-        result.error = f"Failed to connect to destination profile '{dest_profile}': {e}"
+        await source_adapter.close()
+        result.errors.append(
+            f"Failed to connect to destination profile '{dest_profile}': {e}"
+        )
         return result
 
     try:
         # Get counts
-        result.source_counts = _get_data_counts(source_adapter, user_id)
-        result.dest_counts = _get_data_counts(dest_adapter, user_id)
+        result.source_counts = await _get_data_counts(
+            source_adapter, user_id, tables, user_field
+        )
+        result.dest_counts = await _get_data_counts(
+            dest_adapter, user_id, tables, user_field
+        )
 
         # Get slugs for comparison
-        source_slugs = _get_slugs(source_adapter, user_id)
-        dest_slugs = _get_slugs(dest_adapter, user_id)
+        source_slugs = await _get_slugs(
+            source_adapter, user_id, tables, slug_field, user_field
+        )
+        dest_slugs = await _get_slugs(
+            dest_adapter, user_id, tables, slug_field, user_field
+        )
 
-        # Calculate sync plan (what would be transferred)
-        for table in ["projects", "milestones", "tasks"]:
-            src = source_slugs[table]
-            dst = dest_slugs[table]
+        # Calculate sync plan
+        for table in tables:
+            src = source_slugs.get(table, set())
+            dst = dest_slugs.get(table, set())
             result.sync_plan[table] = {
-                "new": len(src - dst),  # In source but not in dest
-                "update": len(src & dst),  # In both (would be updated)
+                "new": len(src - dst),
+                "update": len(src & dst),
             }
 
         result.success = True
 
     except Exception as e:
-        result.error = f"Failed to compare profiles: {e}"
+        result.errors.append(f"Failed to compare profiles: {e}")
 
     finally:
-        source_adapter.close()
-        dest_adapter.close()
+        await source_adapter.close()
+        await dest_adapter.close()
 
     return result
 
 
-def sync_data(
+async def sync_data(
     source_profile: str,
     dest_profile: str,
+    tables: list[str],
+    user_id: str,
+    user_field: str = "user_id",
+    slug_field: str = "slug",
+    env_prefix: str = "",
+    schema: BackupSchema | None = None,
     dry_run: bool = True,
     confirm: bool = False,
 ) -> SyncResult:
     """Sync data from source profile to destination profile.
 
-    Uses backup/restore infrastructure via subprocess:
-    1. Backup from source profile
-    2. Restore to destination profile with mode="overwrite"
+    **Dual-path sync**:
 
-    Records are matched by slug. Source data takes precedence on collision.
+    - When ``schema`` is ``None`` (direct insert path): performs per-table
+      ``select()``/``insert()`` with slug-based matching.  Rows whose slug
+      already exists in the destination are skipped.  No FK remapping.
+
+    - When ``schema`` is provided (backup/restore path): uses
+      ``await backup_database()``/``await restore_database()`` via a temp
+      file for FK-aware restore with ID remapping.
 
     Args:
-        source_profile: Source profile name from db.toml
-        dest_profile: Destination profile name from db.toml
-        dry_run: If True, only show what would be synced without making changes
-        confirm: Must be True to actually perform sync (safety check)
+        source_profile: Source profile name from db.toml.
+        dest_profile: Destination profile name from db.toml.
+        tables: List of table names to sync.
+        user_id: User ID to filter by.
+        user_field: Column name for user ownership filtering.
+            Defaults to ``"user_id"``.
+        slug_field: Column name for slug-based matching.
+            Defaults to ``"slug"``.
+        env_prefix: Prefix for environment variable lookup.
+            Defaults to ``""`` (reads ``DB_PROFILE``).
+        schema: Optional ``BackupSchema`` for FK-aware sync via
+            backup/restore.  When ``None``, uses direct insert path.
+        dry_run: If ``True``, only show what would be synced.
+        confirm: Must be ``True`` to actually perform sync (safety check).
 
     Returns:
-        SyncResult with sync outcome
-    """
-    import os
-    import subprocess
-    import tempfile
-    from pathlib import Path
+        ``SyncResult`` with sync outcome.
 
+    Raises:
+        ValueError: When a FK constraint violation occurs during direct
+            insert (suggests providing a ``BackupSchema``).
+
+    Example:
+        >>> result = await sync_data(
+        ...     "rds", "local",
+        ...     tables=["authors", "books"],
+        ...     user_id="user-1",
+        ...     dry_run=False,
+        ...     confirm=True,
+        ... )
+    """
     # First compare profiles
-    result = compare_profiles(source_profile, dest_profile)
+    result = await compare_profiles(
+        source_profile,
+        dest_profile,
+        tables=tables,
+        user_id=user_id,
+        user_field=user_field,
+        slug_field=slug_field,
+        env_prefix=env_prefix,
+    )
     if not result.success:
         return result
 
@@ -242,58 +378,186 @@ def sync_data(
     if dry_run:
         return result
 
-    # Safety check - require explicit confirmation for actual sync
+    # Safety check
     if not confirm:
-        result.error = "Sync requires --confirm flag to actually perform changes"
+        result.errors.append(
+            "Sync requires confirm=True to actually perform changes"
+        )
         result.success = False
         return result
 
-    # Get core directory for subprocess cwd
-    core_dir = Path(__file__).parent.parent
+    if schema is not None:
+        # Backup/restore path (FK-aware)
+        await _sync_via_backup(result, source_profile, dest_profile,
+                               user_id, schema, env_prefix)
+    else:
+        # Direct insert path (no FK remapping)
+        await _sync_direct(result, source_profile, dest_profile, tables,
+                           user_id, user_field, slug_field, env_prefix)
+
+    return result
+
+
+async def _sync_via_backup(
+    result: SyncResult,
+    source_profile: str,
+    dest_profile: str,
+    user_id: str,
+    schema: BackupSchema,
+    env_prefix: str,
+) -> None:
+    """Sync using backup/restore for FK-aware data transfer.
+
+    Creates a temp backup from source, then restores to destination
+    with ``mode="overwrite"`` for ID remapping.
+
+    Args:
+        result: ``SyncResult`` to update (mutated in place).
+        source_profile: Source profile name.
+        dest_profile: Destination profile name.
+        user_id: User ID to filter by.
+        schema: ``BackupSchema`` driving backup/restore.
+        env_prefix: Prefix for environment variable lookup.
+    """
+    from db_adapter.backup.backup_restore import backup_database, restore_database
+
+    source_adapter: DatabaseClient | None = None
+    dest_adapter: DatabaseClient | None = None
+    backup_path: str | None = None
 
     try:
+        source_adapter = await _create_adapter_for_profile(
+            source_profile, env_prefix
+        )
+        dest_adapter = await _create_adapter_for_profile(
+            dest_profile, env_prefix
+        )
+
         # Create temp backup file
         with tempfile.NamedTemporaryFile(
             suffix=".json", delete=False, mode="w"
         ) as f:
             backup_path = f.name
 
-        # Step 1: Backup from source profile using subprocess
-        env = dict(os.environ)
-        env["MC_DB_PROFILE"] = source_profile
-        backup_result = subprocess.run(
-            ["uv", "run", "python", "backup/backup_cli.py", "backup", "--output", backup_path],
-            cwd=core_dir,
-            capture_output=True,
-            text=True,
-            env=env,
+        # Backup from source
+        await backup_database(
+            source_adapter, schema, user_id=user_id,
+            output_path=backup_path,
         )
-        if backup_result.returncode != 0:
-            result.success = False
-            result.error = f"Backup from {source_profile} failed: {backup_result.stderr}"
-            return result
 
-        # Step 2: Restore to destination profile using subprocess
-        env["MC_DB_PROFILE"] = dest_profile
-        restore_result = subprocess.run(
-            ["uv", "run", "python", "backup/backup_cli.py", "restore", backup_path, "--mode", "overwrite", "--yes"],
-            cwd=core_dir,
-            capture_output=True,
-            text=True,
-            env=env,
+        # Restore to destination
+        summary: dict[str, Any] = await restore_database(
+            dest_adapter, schema, backup_path, user_id=user_id,
+            mode="overwrite",
         )
-        if restore_result.returncode != 0:
-            result.success = False
-            result.error = f"Restore to {dest_profile} failed: {restore_result.stderr}"
-            return result
 
-        # Cleanup temp file
-        Path(backup_path).unlink(missing_ok=True)
+        # Count synced/skipped from summary
+        for table_def in schema.tables:
+            table_summary = summary.get(table_def.name, {})
+            result.synced_count += table_summary.get("inserted", 0)
+            result.synced_count += table_summary.get("updated", 0)
+            result.skipped_count += table_summary.get("skipped", 0)
 
         result.success = True
 
     except Exception as e:
         result.success = False
-        result.error = f"Sync failed: {e}"
+        result.errors.append(f"Sync via backup/restore failed: {e}")
 
-    return result
+    finally:
+        if source_adapter is not None:
+            await source_adapter.close()
+        if dest_adapter is not None:
+            await dest_adapter.close()
+        # Cleanup temp file
+        if backup_path is not None:
+            Path(backup_path).unlink(missing_ok=True)
+
+
+async def _sync_direct(
+    result: SyncResult,
+    source_profile: str,
+    dest_profile: str,
+    tables: list[str],
+    user_id: str,
+    user_field: str,
+    slug_field: str,
+    env_prefix: str,
+) -> None:
+    """Sync using direct select/insert per table.
+
+    For each table, selects all rows from source matching ``user_id``,
+    checks which slugs exist in destination, and inserts rows whose slug
+    does not exist.  Existing slugs are skipped (not updated).
+
+    No FK remapping is performed.  If a FK constraint violation occurs,
+    raises ``ValueError`` suggesting the caller provide a ``BackupSchema``.
+
+    Args:
+        result: ``SyncResult`` to update (mutated in place).
+        source_profile: Source profile name.
+        dest_profile: Destination profile name.
+        tables: List of table names to sync.
+        user_id: User ID to filter by.
+        user_field: Column name for user ownership filtering.
+        slug_field: Column name for slug-based matching.
+        env_prefix: Prefix for environment variable lookup.
+    """
+    source_adapter: DatabaseClient | None = None
+    dest_adapter: DatabaseClient | None = None
+
+    try:
+        source_adapter = await _create_adapter_for_profile(
+            source_profile, env_prefix
+        )
+        dest_adapter = await _create_adapter_for_profile(
+            dest_profile, env_prefix
+        )
+
+        for table in tables:
+            # Get all rows from source
+            source_rows = await source_adapter.select(
+                table, "*", filters={user_field: user_id}
+            )
+
+            # Get existing slugs in destination
+            dest_slug_rows = await dest_adapter.select(
+                table, slug_field, filters={user_field: user_id}
+            )
+            dest_slugs = {r[slug_field] for r in dest_slug_rows}
+
+            # Insert rows whose slug does not exist in dest
+            for row in source_rows:
+                row_slug = row.get(slug_field)
+                if row_slug in dest_slugs:
+                    result.skipped_count += 1
+                    continue
+
+                try:
+                    await dest_adapter.insert(table, data=row)
+                    result.synced_count += 1
+                except Exception as e:
+                    err_type = type(e).__name__
+                    if "ForeignKey" in err_type:
+                        raise ValueError(
+                            f"FK constraint violation inserting into "
+                            f"'{table}': {e}. Consider providing a "
+                            f"BackupSchema for FK-aware sync."
+                        ) from e
+                    raise
+
+        result.success = True
+
+    except ValueError:
+        # Re-raise ValueError (FK suggestion) without wrapping
+        result.success = False
+        raise
+    except Exception as e:
+        result.success = False
+        result.errors.append(f"Direct sync failed: {e}")
+
+    finally:
+        if source_adapter is not None:
+            await source_adapter.close()
+        if dest_adapter is not None:
+            await dest_adapter.close()

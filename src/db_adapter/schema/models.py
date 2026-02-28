@@ -1,28 +1,16 @@
-"""Pydantic models for database configuration and validation."""
+"""Pydantic models for schema introspection and validation.
+
+This module contains schema-domain models:
+- Introspection models: ColumnSchema, ConstraintSchema, IndexSchema,
+  TriggerSchema, FunctionSchema, TableSchema, DatabaseSchema
+- Validation models: ColumnDiff, SchemaValidationResult
+- Connection result: ConnectionResult
+
+Configuration models (DatabaseProfile, DatabaseConfig) live in
+db_adapter.config.models.
+"""
 
 from pydantic import BaseModel, Field
-
-
-# ============================================================================
-# Configuration Models
-# ============================================================================
-
-
-class DatabaseProfile(BaseModel):
-    """Database connection profile from db.toml."""
-
-    url: str
-    description: str = ""
-    db_password: str | None = None  # For [YOUR-PASSWORD] placeholder substitution
-    provider: str = "postgres"  # Defaults to postgres
-
-
-class DatabaseConfig(BaseModel):
-    """Complete database configuration from db.toml."""
-
-    profiles: dict[str, DatabaseProfile]
-    schema_file: str = "schema.sql"
-    validate_on_connect: bool = True
 
 
 # ============================================================================
@@ -39,7 +27,15 @@ class ColumnDiff(BaseModel):
 
 
 class SchemaValidationResult(BaseModel):
-    """Result of schema validation."""
+    """Result of schema validation.
+
+    Example:
+        >>> result = SchemaValidationResult(valid=True)
+        >>> result.error_count
+        0
+        >>> result.format_report()
+        'Schema valid'
+    """
 
     valid: bool
     missing_tables: list[str] = Field(default_factory=list)
@@ -80,11 +76,17 @@ class SchemaValidationResult(BaseModel):
 
 
 class ConnectionResult(BaseModel):
-    """Result of connect_and_validate()."""
+    """Result of connect_and_validate().
+
+    Example:
+        >>> result = ConnectionResult(success=True, profile_name="dev", schema_valid=True)
+        >>> result.success
+        True
+    """
 
     success: bool
     profile_name: str | None = None
-    schema_valid: bool = False
+    schema_valid: bool | None = None
     schema_report: SchemaValidationResult | None = None
     error: str | None = None
 
@@ -95,7 +97,13 @@ class ConnectionResult(BaseModel):
 
 
 class ColumnSchema(BaseModel):
-    """Schema for a database column."""
+    """Schema for a database column.
+
+    Example:
+        >>> col = ColumnSchema(name="id", data_type="uuid")
+        >>> col.is_nullable
+        True
+    """
 
     name: str
     data_type: str

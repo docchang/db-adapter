@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-"""Command-line interface for Mission Control backup and restore.
+"""Database backup and restore CLI.
+
+Standalone CLI for backup/restore operations. This module is kept as an
+unregistered submodule -- consuming projects wire backup commands in their
+own CLI with a caller-provided BackupSchema.
 
 Usage:
-    python backup_cli.py backup
-    python backup_cli.py backup --project mission-control
-    python backup_cli.py restore backup/backups/backup-2025-12-30.json
-    python backup_cli.py restore backup/backups/backup.json --mode overwrite
-    python backup_cli.py restore backup/backups/backup.json --dry-run
-    python backup_cli.py validate backup/backups/backup.json
+    python -m db_adapter.cli.backup backup
+    python -m db_adapter.cli.backup backup --project my-project
+    python -m db_adapter.cli.backup restore backups/backup-2025-12-30.json
+    python -m db_adapter.cli.backup restore backups/backup.json --mode overwrite
+    python -m db_adapter.cli.backup restore backups/backup.json --dry-run
+    python -m db_adapter.cli.backup validate backups/backup.json
 """
 
 import argparse
 import sys
 from pathlib import Path
 
-# Add parent directory to path for imports when run directly
-if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from backup.backup_restore import backup_database, restore_database, validate_backup
+from db_adapter.backup.backup_restore import backup_database, restore_database, validate_backup
 
 
 def cmd_backup(args):
@@ -26,11 +26,11 @@ def cmd_backup(args):
     try:
         backup_path = backup_database(
             output_path=args.output,
-            project_slugs=args.projects if args.projects else None,
+            project_slugs=args.items if args.items else None,
         )
 
         # Create 'latest.json' symlink if full backup
-        if not args.projects and not args.output:
+        if not args.items and not args.output:
             # Use path relative to backup module
             backups_dir = Path(__file__).parent / "backups"
             latest_path = backups_dir / "latest.json"
@@ -117,7 +117,7 @@ def cmd_validate(args):
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
-        description="Mission Control backup and restore utility",
+        description="Database backup and restore utility",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -160,8 +160,8 @@ Examples:
     backup_parser.add_argument(
         "--project", "-p",
         action="append",
-        dest="projects",
-        help="Backup specific project(s) by slug (can be used multiple times)"
+        dest="items",
+        help="Backup specific item(s) by slug (can be used multiple times)"
     )
     backup_parser.set_defaults(func=cmd_backup)
 

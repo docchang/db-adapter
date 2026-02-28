@@ -77,12 +77,12 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/ -v --tb=short
 
 **Commands**:
 ```bash
-cd /Users/docchang/Development/db-adapter && uv sync --extra dev
+cd /Users/docchang/Development/db-adapter && uv sync --extra dev --extra supabase
 ```
 
 **Verification** (inline OK for prerequisites):
 ```bash
-cd /Users/docchang/Development/db-adapter && uv run python -c "import sqlalchemy; import pydantic; import asyncpg; print('Dependencies OK')"
+cd /Users/docchang/Development/db-adapter && uv run python -c "import sqlalchemy; import pydantic; import asyncpg; import supabase; print('Dependencies OK')"
 # Expected: "Dependencies OK"
 ```
 
@@ -177,7 +177,7 @@ pyproject.toml               # Dependencies
 | Step 5 | #7 | Comparator decoupling |
 | Step 6 | #5 | Adapter async |
 | Step 7 | #6 | Introspector async |
-| Step 8 | #2 (async) | Factory async |
+| Step 8 | #2 (async) | Factory async (plan refinement: not a separate design analysis item; the design's #2 covers MC removal only, async conversion is implicit) |
 | Step 9 | #8 | Fix module generalization |
 | Step 10 | #10 | Backup generalization |
 | Step 11 | #9 | Sync generalization |
@@ -204,7 +204,7 @@ cd /Users/docchang/Development/db-adapter && mkdir -p tests && touch tests/__ini
 
 **Verification** (inline OK for Step 0):
 ```bash
-cd /Users/docchang/Development/db-adapter && uv run python -c "import sqlalchemy; import pydantic; import asyncpg; import psycopg; print('OK')"
+cd /Users/docchang/Development/db-adapter && uv run python -c "import sqlalchemy; import pydantic; import asyncpg; import psycopg; import supabase; print('OK')"
 # Expected: OK
 ```
 
@@ -226,7 +226,8 @@ cd /Users/docchang/Development/db-adapter && uv run python -c "import sqlalchemy
 - `schema/models.py` currently has 12 classes; after removing `DatabaseProfile` and `DatabaseConfig`, it keeps 10 classes: `ColumnSchema`, `ConstraintSchema`, `IndexSchema`, `TriggerSchema`, `FunctionSchema`, `TableSchema`, `DatabaseSchema`, `ColumnDiff`, `SchemaValidationResult`, `ConnectionResult`
 - Remove all classes from `config/models.py` that are not `DatabaseProfile` or `DatabaseConfig` (i.e., remove `ColumnDiff`, `SchemaValidationResult`, `ConnectionResult`, `ColumnSchema`, `ConstraintSchema`, `IndexSchema`, `TriggerSchema`, `FunctionSchema`, `TableSchema`, `DatabaseSchema`)
 - Remove `DatabaseProfile` and `DatabaseConfig` from `schema/models.py` so they exist only in `config/models.py`
-- Tests must verify: each class exists in exactly one file; `DatabaseProfile` and `DatabaseConfig` importable from `config/models`; `SchemaValidationResult`, `ConnectionResult`, and introspection models importable from `schema/models`
+- Note: Removing classes from `schema/models.py` will break existing bare imports in `config/loader.py` (line 11), `factory.py` (line 18), and `schema/sync.py` (line 30). These are fixed in Step 2 (Fix Package Imports). Tests for this step should use direct file inspection (e.g., class name grep) or `db_adapter.*` package imports rather than runtime imports of consuming modules.
+- Tests must verify: each class exists in exactly one file; `DatabaseProfile` and `DatabaseConfig` importable from `db_adapter.config.models`; `SchemaValidationResult`, `ConnectionResult`, and introspection models importable from `db_adapter.schema.models`
 
 **Acceptance Criteria**:
 - `config/models.py` contains exactly 2 model classes: `DatabaseProfile`, `DatabaseConfig`
@@ -272,19 +273,24 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
   - `from schema.db_models import ...` -> REMOVE
   - `from db import ...` -> `from db_adapter.factory import ...`
   - `from backup.backup_restore import ...` -> `from db_adapter.backup.backup_restore import ...`
-  - `from backup.backup_cli import ...` -> `from db_adapter.cli.backup import ...` (included for completeness; this import pattern may not exist in current codebase)
-- For MC-specific imports that are removed (`fastmcp`, `creational.common`, `mcp.server.auth`, `schema.db_models`, `config.get_settings`): comment them out or remove the lines. The functions that depend on them will be cleaned up in later steps (Steps 3-4 for factory/config, Step 5 for comparator, etc.)
+  - ~~`from backup.backup_cli import ...` -> `from db_adapter.cli.backup import ...`~~ (speculative -- this import pattern does not exist in the current codebase; removed)
+- Note: This mapping also applies to deferred imports inside function bodies and `TYPE_CHECKING` blocks. Files with function-level bare imports include: `schema/fix.py` (lines 212, 296-299, 396), `schema/sync.py` (lines 138-140), `cli/__init__.py` (lines 152, 407, 439, 521-523). Files with top-level bare imports (not inside functions): `cli/backup.py` (line 21, after `if __name__` guard), `backup/backup_restore.py` (lines 22-24).
+- For MC-specific imports that are removed (`fastmcp`, `creational.common`, `mcp.server.auth`, `schema.db_models`, `config.get_settings`): comment them out with a `# REMOVED:` prefix (e.g., `# REMOVED: from fastmcp import Context`) so later steps can see what was there. Do NOT delete — later cleanup steps will delete the comments when the dependent code is removed.
+- For functions whose bodies depend on removed MC imports (e.g., `get_user_id_from_ctx()` uses `Context`, `get_settings()` uses `SharedSettings`): replace the function body with `pass` to maintain syntactic validity. Keep the function signature and docstring intact. Later steps (Steps 3-4 for factory/config, Step 5 for comparator, etc.) will remove or rewrite these functions entirely.
+- Remove the `sys.path.insert` workaround in `cli/backup.py` (line 19) since proper `db_adapter.*` package imports make it unnecessary
 - `adapters/__init__.py` must import from `db_adapter.adapters.base` and `db_adapter.adapters.postgres` (not `adapters.postgres_adapter`)
 - Tests must verify: `import db_adapter`, `from db_adapter.config.models import DatabaseProfile`, `from db_adapter.schema.models import SchemaValidationResult`, `from db_adapter.backup.models import BackupSchema` all succeed without `ModuleNotFoundError`
 
 **Acceptance Criteria**:
 - `grep -rPn "^\s*from (adapters|config|schema\.|db\b(?!_adapter)|backup\.)" src/db_adapter/ --include="*.py"` returns zero results for bare imports (anchored to line start; `db\b(?!_adapter)` avoids false positives on `from db_adapter.*` imports)
+- `grep -rPn "from (fastmcp|creational\.common|mcp\.server\.auth|schema\.db_models) " src/db_adapter/ --include="*.py"` returns zero results (excluding `# REMOVED:` comment lines) -- verifies MC-specific external imports are removed/commented
 - `uv run python -c "import db_adapter"` succeeds without `ModuleNotFoundError`
 - `uv run python -c "from db_adapter.config.models import DatabaseProfile; from db_adapter.schema.models import SchemaValidationResult; from db_adapter.backup.models import BackupSchema; print('OK')"` succeeds
+- `uv run python -c "from db_adapter import factory; from db_adapter import cli; from db_adapter.schema import comparator, fix, sync; from db_adapter.backup import backup_restore; print('All subpackages OK')"` succeeds -- verifies all subpackages import cleanly
 - Tests pass verifying subpackage imports
 
 **Trade-offs**:
-- **Handling MC-specific imports**: Comment out rather than delete because later steps need to see what was there and replace functionally. Alternative: delete now and re-check in later steps from design doc.
+- **Handling MC-specific imports**: Comment out with `# REMOVED:` prefix rather than delete, because later steps need to see what was there and replace functionally. Each cleanup step (3-5, 9-12) deletes the `# REMOVED:` comments when the dependent code is removed. Alternative: delete now and re-check in later steps from design doc.
 
 **Verification**:
 ```bash
@@ -299,18 +305,16 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 
 **Goal**: Strip `Settings` class, `get_settings()`, and `SharedSettings` import from `config/loader.py`. Keep only the generic TOML-based `load_db_config()`.
 
-- [ ] Remove `Settings(SharedSettings)` class entirely
+- [ ] Remove `Settings(SharedSettings)` class entirely and all its supporting imports (`from functools import lru_cache`, `from pydantic import AliasChoices, Field`)
 - [ ] Remove `get_settings()` function
-- [ ] Remove `from creational.common.config import SharedSettings`
-- [ ] Remove `from functools import lru_cache`
-- [ ] Remove `from pydantic import AliasChoices, Field`
-- [ ] Update `load_db_config()` import to `from db_adapter.config.models import DatabaseConfig, DatabaseProfile` (Step 2 converted bare `from schema.models` imports to `db_adapter.*` paths; this step ensures loader.py uses the canonical location after Step 1's consolidation)
+- [ ] Remove the `# REMOVED: from creational.common.config import SharedSettings` comment (left by Step 2)
+- [ ] Verify `load_db_config()` import is `from db_adapter.config.models import DatabaseConfig, DatabaseProfile` (already set by Step 2; this step confirms loader.py uses the canonical location after Step 1's consolidation)
 - [ ] Change default `config_path` from `Path(__file__).parent / "db.toml"` to `Path.cwd() / "db.toml"` (library reads config from consuming project's working directory, not from inside the installed package)
 - [ ] Update `config/__init__.py` to export `load_db_config`, `DatabaseProfile`, `DatabaseConfig`
 - [ ] Write tests
 
 **Specification**:
-- `config/loader.py` after this step should contain only: `import tomllib`, `from pathlib import Path`, `from db_adapter.config.models import DatabaseConfig, DatabaseProfile`, and the `load_db_config()` function
+- `config/loader.py` after this step should have imports limited to: `import tomllib`, `from pathlib import Path`, `from db_adapter.config.models import DatabaseConfig, DatabaseProfile` — plus the `load_db_config()` function and module docstring
 - `load_db_config(config_path: Path | None = None) -> DatabaseConfig` signature unchanged except default path changes to `Path.cwd() / "db.toml"`
 - Tests must verify: `load_db_config()` with a sample TOML file parses profiles correctly; `load_db_config()` raises `FileNotFoundError` when file is missing; no `Settings` or `get_settings` importable from the module
 
@@ -319,6 +323,7 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 - `grep -En "class Settings|def get_settings|SharedSettings" src/db_adapter/config/loader.py` returns nothing
 - `load_db_config()` loads a TOML file with profiles and returns a `DatabaseConfig` with correct `DatabaseProfile` entries
 - Default config path is `Path.cwd() / "db.toml"` (not `Path(__file__).parent`)
+- `from db_adapter.config import load_db_config, DatabaseProfile, DatabaseConfig` succeeds without ImportError
 - Tests pass
 
 **Verification**:
@@ -342,7 +347,11 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 - [ ] Remove `reset_client()` function
 - [ ] Remove module-level `_adapter` global cache
 - [ ] Remove `from fastmcp import Context` import
+- [ ] Remove all `# REMOVED:` comments in `factory.py` left by Step 2's import cleanup (e.g., `# REMOVED: from config import get_settings`)
+- [ ] Remove `db.toml` existence check (lines 272-274) and `MC_DATABASE_URL` env var fallback (line 286) from old `get_db_adapter()` logic -- replaced by `get_adapter()` parameter precedence
 - [ ] Add `env_prefix` parameter to `get_active_profile_name()`
+- [ ] Add `env_prefix` parameter to `connect_and_validate()`
+- [ ] Forward `env_prefix` in `get_active_profile()` to `get_active_profile_name()`
 - [ ] Add `expected_columns` parameter to `connect_and_validate()`
 - [ ] Rename `get_db_adapter()` to `get_adapter()` with `env_prefix`, `database_url`, `jsonb_columns` parameters
 - [ ] Change `_PROFILE_LOCK_FILE` to use `Path.cwd()` instead of `Path(__file__).parent`
@@ -352,14 +361,14 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 - [ ] Write tests
 
 **Specification**:
-- `factory.py` keeps: `ProfileNotFoundError`, `read_profile_lock()`, `write_profile_lock()`, `clear_profile_lock()`, `get_active_profile_name()`, `get_active_profile()`, `_resolve_url()`, `connect_and_validate()`, `get_adapter()`
-- `get_active_profile_name(env_prefix: str = "") -> str`: reads `{env_prefix}DB_PROFILE` env var (e.g., `MC_DB_PROFILE` when `env_prefix="MC_"`)
-- `connect_and_validate(profile_name, expected_columns, env_prefix, validate_only) -> ConnectionResult`: when `expected_columns` is `None`, skip schema validation (connection-only mode). Note: accept `expected_columns` param but only use for the None-skip logic in Step 4; the actual pass-through to `validate_schema(actual, expected)` happens in Step 8 after the comparator signature changes in Step 5.
-- `get_adapter(profile_name: str | None = None, env_prefix: str = "", database_url: str | None = None, jsonb_columns: list[str] | None = None) -> DatabaseClient`: factory function, no caching. Creates a new adapter each time. If `profile_name` is None, resolves from lock file or env var (with prefix). If `database_url` is provided, uses it directly (ignores profile).
+- `factory.py` keeps: `ProfileNotFoundError`, `read_profile_lock()`, `write_profile_lock()`, `clear_profile_lock()`, `get_active_profile_name()`, `get_active_profile(env_prefix: str = "")` (forwards `env_prefix` to `get_active_profile_name()`), `resolve_url()` (renamed from `_resolve_url` to public API — used cross-module by `sync.py` in Step 11), `connect_and_validate()`, `get_adapter()`
+- `get_active_profile_name(env_prefix: str = "") -> str`: reads `{env_prefix}DB_PROFILE` env var. When `env_prefix=""` (default), reads `DB_PROFILE`. When `env_prefix="MC_"`, reads `MC_DB_PROFILE`. Empty prefix produces no prefix — the library default is generic.
+- `connect_and_validate(profile_name, expected_columns, env_prefix, validate_only) -> ConnectionResult`: when `expected_columns` is `None`, skip schema validation (connection-only mode). When `expected_columns` is not `None`, the `validate_schema()` call retains its current 1-arg signature (`validate_schema(actual_columns)`) for now -- passing `expected_columns` through happens in Step 5 when the comparator signature changes to 2-param. Note: accept `expected_columns` param but only use for the None-skip logic in Step 4; the actual pass-through to `validate_schema(actual, expected)` happens after Step 5 changes the comparator signature.
+- `get_adapter(profile_name: str | None = None, env_prefix: str = "", database_url: str | None = None, jsonb_columns: list[str] | None = None) -> DatabaseClient`: factory function, no caching. Creates a new adapter each time. **Parameter precedence**: if `database_url` is provided, use it directly (ignore `profile_name` and `env_prefix`). If `database_url` is None, use `profile_name` if provided, else resolve from lock file / env var with prefix. If all resolution fails and lock file is missing, raise `ProfileNotFoundError`. Note: this replaces the old `get_db_adapter()` logic including the `db.toml` existence check and `MC_DATABASE_URL` env var fallback -- those legacy code paths are removed entirely.
 - `_PROFILE_LOCK_FILE` = `Path.cwd() / ".db-profile"` (not inside package)
 - All MC-specific error messages referencing `python -m schema` or `MC_DB_PROFILE` must be updated to use generic `db-adapter` references
-- Tests must verify: `ProfileNotFoundError` raised when no profile; `_resolve_url()` password substitution works; `get_active_profile_name()` reads env var with prefix; `get_adapter()` returns adapter for given URL; `connect_and_validate()` skips validation when `expected_columns` is `None`
-- **Test scope note**: Step 4 tests cover the sync factory API (MC removal, new parameters, sync function signatures). Step 8 rewrites these tests for the async factory API (`async def`, `AsyncPostgresAdapter` creation, `async with SchemaIntrospector`).
+- Tests must verify: `ProfileNotFoundError` raised when no profile; `resolve_url()` password substitution works; `get_active_profile_name()` reads env var with prefix; `get_adapter()` returns adapter for given URL; `connect_and_validate()` skips validation when `expected_columns` is `None`
+- **Test scope note**: Step 4 tests cover the sync factory API (MC removal, new parameters, sync function signatures). Step 8 rewrites these tests for the async factory API (`async def`, `AsyncPostgresAdapter` creation, `async with SchemaIntrospector`). Note: when `expected_columns` is not None, `validate_schema(actual_columns)` still uses its old 1-arg internal logic (which calls `get_all_expected_columns()` from `schema.db_models`). Since `schema.db_models` is unavailable after Step 2, the non-None path will raise `NameError` (undefined `get_all_expected_columns`). Tests should only exercise `expected_columns=None` until Step 5 changes the comparator signature.
 
 **Acceptance Criteria**:
 - `factory.py` has zero imports from `fastmcp`, `mcp`, or `creational`
@@ -367,7 +376,7 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 - No module-level mutable state (`global _adapter`)
 - `get_active_profile_name(env_prefix="MC_")` reads `MC_DB_PROFILE` env var
 - `connect_and_validate(expected_columns=None)` returns `ConnectionResult` without calling `validate_schema`
-- `_resolve_url()` correctly substitutes `[YOUR-PASSWORD]` placeholder
+- `resolve_url()` correctly substitutes `[YOUR-PASSWORD]` placeholder
 - Tests pass
 
 **Trade-offs**:
@@ -386,10 +395,10 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 
 **Goal**: Decouple `validate_schema()` from MC's `db_models` module by changing its signature to accept both `actual_columns` and `expected_columns` as parameters. Remove the MC-specific `from schema.db_models import get_all_expected_columns` import.
 
-- [ ] Remove `from schema.db_models import get_all_expected_columns` import (already converted to `from db_adapter...` or commented out in Step 2)
+- [ ] Remove `from schema.db_models import get_all_expected_columns` import (already commented out with `# REMOVED:` prefix in Step 2)
 - [ ] Change `validate_schema()` signature to `validate_schema(actual_columns, expected_columns)`
 - [ ] Remove internal call to `get_all_expected_columns()` -- use `expected_columns` parameter instead
-- [ ] Update module docstring to reflect new API
+- [ ] Update module docstring to reflect new 2-param API (show usage: `result = validate_schema(actual_columns, expected_columns)`)
 - [ ] Update the `validate_schema()` call site in `factory.py` to pass `expected_columns` from `connect_and_validate()`'s own parameter. If `expected_columns` is None, skip the `validate_schema()` call entirely (connection-only mode per Step 4) — this prevents a broken call site between Steps 5 and 8
 - [ ] Write tests
 
@@ -401,11 +410,12 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 - Tests must verify: missing tables detected, missing columns detected, extra tables detected (warning only), valid schema returns `valid=True`, empty expected returns valid
 
 **Acceptance Criteria**:
-- `comparator.py` has zero imports from `schema.db_models`
+- `comparator.py` has zero imports referencing `db_models` in any form (neither bare `schema.db_models` nor package-qualified `db_adapter.schema.db_models`)
 - `validate_schema()` accepts exactly 2 positional parameters: `actual_columns` and `expected_columns`
 - `validate_schema({"t1": {"a", "b"}}, {"t1": {"a", "b", "c"}})` returns `SchemaValidationResult(valid=False, missing_columns=[ColumnDiff(table="t1", column="c", ...)])`
 - `validate_schema({"t1": {"a"}}, {"t1": {"a"}})` returns `SchemaValidationResult(valid=True)`
 - `validate_schema({"t1": {"a"}}, {"t2": {"a"}})` returns missing table `t2` and extra table `t1`
+- `validate_schema({"t1": {"a"}}, {})` returns `SchemaValidationResult(valid=True)` with extra table `t1` (empty expected means all tables are extra)
 - Tests pass
 
 **Verification**:
@@ -434,27 +444,29 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 - [ ] Rename `SupabaseAdapter` to `AsyncSupabaseAdapter`
 - [ ] Replace `supabase.Client` / `create_client` with `supabase.acreate_client`
 - [ ] Implement lazy async init with `asyncio.Lock`
-- [ ] Update `adapters/__init__.py` exports
+- [ ] Update `adapters/__init__.py` exports (fix pre-existing broken import: line 7 imports from `adapters.postgres_adapter` but actual file is `adapters/postgres.py` — verify Step 2 resolves this, or fix here)
 - [ ] Write tests
 
 **Specification**:
 - `DatabaseClient` Protocol methods: `async def select(...)`, `async def insert(...)`, `async def update(...)`, `async def delete(...)`, `async def close(...)`. Note: `async def execute(...)` is added in Step 9. `test_connection()` is converted from the existing sync method in this step (see checklist) — it exists on adapter classes but is NOT a Protocol method.
 - `AsyncPostgresAdapter.__init__(self, database_url: str, jsonb_columns: list[str] | None = None, **engine_kwargs)`:
-  - Converts `postgresql://` to `postgresql+asyncpg://` (prefix match, not global replace)
+  - First normalizes `postgres://` alias to `postgresql://` (handles providers like Heroku, Railway, Supabase), then converts `postgresql://` to `postgresql+asyncpg://` (prefix match, not global replace)
   - Stores `frozenset(jsonb_columns or [])` as `self._jsonb_columns`
   - Creates engine via `create_async_engine_pooled(async_url, **engine_kwargs)`
 - `create_async_engine_pooled(database_url: str, **kwargs) -> AsyncEngine`: replaces `create_mc_engine()`, uses `create_async_engine` with same pool settings
 - `AsyncSupabaseAdapter.__init__(self, url: str, key: str)`: stores URL/key, `self._client = None`, `self._lock = asyncio.Lock()`
 - `AsyncSupabaseAdapter._get_client(self) -> AsyncClient`: lazy init with lock
+- `AsyncPostgresAdapter.test_connection(self) -> bool`: runs `SELECT 1` via async engine connection, returns `True` on success. Converted from existing sync method. Note: `test_connection()` is only on `AsyncPostgresAdapter` — `AsyncSupabaseAdapter` does not have this method (Supabase client handles connection internally via lazy init).
 - `AsyncSupabaseAdapter.close(self)`: if `self._client` is not None, close it; if client was never initialized, no-op
 - `adapters/__init__.py`: export `DatabaseClient`, `AsyncPostgresAdapter`; conditional `AsyncSupabaseAdapter` export with `try/except ImportError`
-- Tests must verify: `AsyncPostgresAdapter` has all `async def` CRUD methods; `JSONB_COLUMNS` is NOT a class constant (constructor param); URL rewrite from `postgresql://` to `postgresql+asyncpg://`; `DatabaseClient` Protocol defines async methods; `AsyncSupabaseAdapter` uses lazy client init pattern
+- `AsyncSupabaseAdapter` CRUD methods (`select`, `insert`, `update`, `delete`) must `await` the `.execute()` call on the supabase-py query builder chain (e.g., `result = await self._client.table(table).select("*").execute()`)
+- Tests must verify: `AsyncPostgresAdapter` has all `async def` CRUD methods; `JSONB_COLUMNS` is NOT a class constant (constructor param); URL rewrite from `postgresql://` to `postgresql+asyncpg://` (including `postgres://` alias); `DatabaseClient` Protocol defines async methods; `AsyncSupabaseAdapter` uses lazy client init pattern; `from db_adapter.adapters import AsyncPostgresAdapter` succeeds even when `supabase` extra is not installed (conditional import works)
 
 **Acceptance Criteria**:
 - `PostgresAdapter` class no longer exists; only `AsyncPostgresAdapter`
 - `create_mc_engine` function no longer exists; only `create_async_engine_pooled`
 - `JSONB_COLUMNS` does not appear as a class constant (`grep "JSONB_COLUMNS = frozenset" src/` returns nothing)
-- All 5 Protocol methods are `async def` in `base.py`
+- All 5 CRUD+lifecycle Protocol methods (`select`, `insert`, `update`, `delete`, `close`) are `async def` in `base.py` (note: Step 9 adds a 6th method `execute`)
 - `AsyncPostgresAdapter` uses `from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine`
 - `AsyncSupabaseAdapter` uses `from supabase import acreate_client, AsyncClient`
 - All `engine.connect()` and `engine.begin()` calls use `async with` (not sync `with`)
@@ -485,17 +497,19 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 - [ ] Write tests
 
 **Specification**:
-- `SchemaIntrospector.__init__(self, database_url: str, excluded_tables: set[str] | None = None, connect_timeout: int = 10)`: `excluded_tables` defaults to `EXCLUDED_TABLES_DEFAULT` class constant (`{"schema_migrations", "pg_stat_statements", "spatial_ref_sys"}`). Preserve the existing `connect_timeout` parameter from the sync implementation.
-- `async def __aenter__(self) -> "SchemaIntrospector"`: opens `psycopg.AsyncConnection`
+- `SchemaIntrospector.__init__(self, database_url: str, excluded_tables: set[str] | None = None, connect_timeout: int = 10)`: `excluded_tables` defaults to `EXCLUDED_TABLES_DEFAULT` class constant (`{"schema_migrations", "pg_stat_statements", "spatial_ref_sys"}`). Promote the existing hardcoded `connect_timeout=10` URL appendage (sync `__enter__`, lines 60-64) to an explicit constructor parameter.
+- `async def __aenter__(self) -> "SchemaIntrospector"`: opens `psycopg.AsyncConnection` with `connect_timeout` passed as kwarg: `self._conn = await psycopg.AsyncConnection.connect(self._database_url, connect_timeout=self._connect_timeout)`
 - `async def __aexit__(...)`: closes connection
-- `async def test_connection(...)`: tests the database connection (I/O operation, must be async)
+- `async def test_connection(self) -> bool`: runs `SELECT 1` via async cursor on the already-open connection, returns `True` on success, raises `ConnectionError` on failure.
 - `async def introspect(...)`, `async def get_column_names(...)`, `async def _get_tables(...)`, `async def _get_columns(...)`, `async def _get_constraints(...)`, `async def _get_indexes(...)`, `async def _get_triggers(...)`, `async def _get_functions(...)`
 - `def _normalize_data_type(...)` stays sync (pure logic)
 - Cursor usage: `async with self._conn.cursor() as cur: await cur.execute(...); rows = await cur.fetchall()`
 - Tests must verify: class has `__aenter__`/`__aexit__` (not `__enter__`/`__exit__`); query methods are coroutines; `_normalize_data_type` remains sync; `excluded_tables` is configurable
 
 **Acceptance Criteria**:
-- `grep -En "psycopg.connect|def __enter__|def __exit__" src/db_adapter/schema/introspector.py` returns nothing
+- `grep -En "psycopg.connect|def __enter__|def __exit__" src/db_adapter/schema/introspector.py` returns nothing (sync patterns removed)
+- `grep -E "__aenter__|__aexit__" src/db_adapter/schema/introspector.py` returns both methods (async patterns present)
+- `grep "AsyncConnection" src/db_adapter/schema/introspector.py` returns at least one match
 - `SchemaIntrospector` has `__aenter__` and `__aexit__` methods
 - All query methods (`test_connection`, `introspect`, `get_column_names`, `_get_tables`, `_get_columns`, `_get_constraints`, `_get_indexes`, `_get_triggers`, `_get_functions`) are `async def`
 - `_normalize_data_type` is a regular `def` (not async)
@@ -523,12 +537,13 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 - [ ] Write tests
 
 **Specification**:
-- `async def connect_and_validate(profile_name, expected_columns, env_prefix, validate_only) -> ConnectionResult`
-- `async def get_adapter(profile_name, env_prefix, database_url, jsonb_columns) -> DatabaseClient`
+- `async def connect_and_validate(profile_name: str | None = None, expected_columns: dict[str, set[str]] | None = None, env_prefix: str = "", validate_only: bool = False) -> ConnectionResult`
+- `async def get_adapter(profile_name: str | None = None, env_prefix: str = "", database_url: str | None = None, jsonb_columns: list[str] | None = None) -> DatabaseClient`
 - Inside `connect_and_validate()`: `async with SchemaIntrospector(url) as introspector: actual = await introspector.get_column_names()`
 - When `expected_columns` is `None`: skip both introspection and validation entirely (connection-only mode — do not open `SchemaIntrospector`). When `expected_columns` is provided: `validation = validate_schema(actual, expected_columns)` (sync call, comparator stays sync).
 - `get_adapter()` creates `AsyncPostgresAdapter(database_url=url, jsonb_columns=jsonb_columns)`. Note: `get_adapter()` is async for API consistency with `connect_and_validate()` and to allow future async initialization steps, even though current implementation performs no I/O requiring await.
 - Tests must verify: both functions are coroutines; `connect_and_validate` returns `ConnectionResult`; `get_adapter` returns an `AsyncPostgresAdapter` instance (tested via mock/patch of adapter creation)
+- **Test lifecycle**: Modify `test_lib_extraction_factory.py` (created in Step 4) to replace sync factory tests with async factory tests. Do not create a separate test file — update the existing one so that orphaned sync tests are not left behind.
 
 **Acceptance Criteria**:
 - `connect_and_validate` and `get_adapter` are `async def` in `factory.py`
@@ -562,13 +577,13 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 - [ ] Write tests
 
 **Specification**:
-- `generate_fix_plan(validation_result: SchemaValidationResult, column_definitions: dict[str, str], schema_file: str | Path) -> FixPlan` -- pure sync logic, no I/O. Callers must first obtain `validation_result` by running introspection and comparison: `async with SchemaIntrospector(url) as i: actual = await i.get_column_names()` then `result = validate_schema(actual, expected)`.
-- `async def apply_fixes(adapter: DatabaseClient, plan: FixPlan, backup_fn: Callable[[DatabaseClient, str], Awaitable[str]] | None = None, restore_fn: Callable[[DatabaseClient, str], Awaitable[None]] | None = None, verify_fn: Callable[[DatabaseClient], Awaitable[bool]] | None = None, dry_run: bool = True, confirm: bool = False) -> FixResult` -- callbacks are async; `backup_fn(adapter, table_name)` returns backup path, `restore_fn(adapter, backup_path)` restores, `verify_fn(adapter)` verifies post-fix state
-- `FixPlan` dataclass: remove `profile_name`, add `drop_order: list[str]`, `create_order: list[str]`. `generate_fix_plan()` computes these from FK relationships in `schema_file` (reverse topological sort for drops, forward topological sort for creates).
+- `generate_fix_plan(validation_result: SchemaValidationResult, column_definitions: dict[str, str], schema_file: str | Path) -> FixPlan` -- pure sync logic (file reads only, no network I/O). `column_definitions` keys use `"table.column"` format (e.g., `{"users.email": "TEXT NOT NULL", "users.status": "TEXT NOT NULL DEFAULT 'active'"}`). Values are SQL type definition strings used for ALTER TABLE ADD COLUMN statements. Callers must first obtain `validation_result` by running introspection and comparison: `async with SchemaIntrospector(url) as i: actual = await i.get_column_names()` then `result = validate_schema(actual, expected)`.
+- `async def apply_fixes(adapter: DatabaseClient, plan: FixPlan, backup_fn: Callable[[DatabaseClient, str], Awaitable[str]] | None = None, restore_fn: Callable[[DatabaseClient, str], Awaitable[None]] | None = None, verify_fn: Callable[[DatabaseClient], Awaitable[bool]] | None = None, dry_run: bool = True, confirm: bool = False) -> FixResult` -- callbacks are async and operate **per-table**: `backup_fn(adapter, table_name)` backs up a single table and returns the backup file path, `restore_fn(adapter, backup_path)` restores from that single-table backup if the fix fails, `verify_fn(adapter)` verifies post-fix state of the entire database. `apply_fixes()` should wrap each `execute()` call with a clear error: if adapter raises `NotImplementedError`, raise `RuntimeError("DDL operations not supported for this adapter type")`. Per-call wrapping is intentional — it allows partial DDL execution reporting before failure. All DDL execution in `apply_fixes()` must use `adapter.execute(sql)` Protocol method, not `adapter._conn` or `adapter._engine` internals.
+- `FixPlan` dataclass: remove `profile_name`, add `drop_order: list[str]`, `create_order: list[str]`. `generate_fix_plan()` computes these by parsing `REFERENCES` clauses from CREATE TABLE statements in `schema_file` to build an FK dependency graph, then applying reverse topological sort for `drop_order` and forward topological sort for `create_order`.
 - `FixResult` Pydantic model: remove `profile_name`
 - `DatabaseClient` Protocol: add `async def execute(self, sql: str, params: dict | None = None) -> None: ...` for DDL. Implement on `AsyncPostgresAdapter` via `async with self._engine.begin() as conn: await conn.execute(text(sql), params)`. `AsyncSupabaseAdapter` raises `NotImplementedError` (DDL not supported via Supabase client).
 - `_get_table_create_sql(table_name: str, schema_file: str | Path) -> str` -- `schema_file` is required (no None default, no fallback path)
-- Tests must verify: `generate_fix_plan()` creates correct plan from validation result and column definitions; `FixPlan` has no `profile_name`; `_get_table_create_sql` requires `schema_file`; `ColumnFix.to_sql()` generates correct ALTER TABLE; `TableFix.to_sql()` returns CREATE TABLE SQL
+- Tests must verify: `generate_fix_plan()` creates correct plan from validation result and column definitions; `FixPlan` has no `profile_name`; `_get_table_create_sql` requires `schema_file`; `ColumnFix.to_sql()` generates correct ALTER TABLE; `TableFix.to_sql()` returns CREATE TABLE SQL; `drop_order`/`create_order` topological sort is correct (e.g., child tables dropped before parent, parent tables created before child)
 
 **Acceptance Criteria**:
 - `COLUMN_DEFINITIONS` dict does not exist in `fix.py`
@@ -577,6 +592,7 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 - `apply_fixes()` is `async def` and accepts adapter + callbacks
 - `FixPlan` and `FixResult` have no `profile_name` field
 - `DatabaseClient` Protocol has `execute` method
+- Calling `apply_fixes()` with an adapter that raises `NotImplementedError` on `execute()` raises `RuntimeError` with message "DDL operations not supported for this adapter type"
 - Tests pass
 
 **Trade-offs**:
@@ -602,8 +618,9 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 - [ ] Use `TableDef.parent` and `TableDef.optional_refs` for generic FK remapping
 - [ ] Build generic `id_maps: dict[str, dict]` keyed by table name
 - [ ] Remove `from db import get_db_adapter, get_dev_user_id` and `from config import get_settings`
-- [ ] Update `validate_backup()` to accept `schema: BackupSchema` parameter; fix version check logic to accept `"1.1"` as expected version
+- [ ] Update `validate_backup()` to accept `schema: BackupSchema` parameter; fix version check logic to require `"1.1"` as expected version (reject `"1.0"` — old format not supported)
 - [ ] Convert `backup_database()` and `restore_database()` to async (`validate_backup()` stays sync — local file read only)
+- [ ] Update `backup/models.py` docstring example to use generic table names instead of MC-specific `projects`/`milestones`/`tasks` (prevents Step 14 grep check failure)
 - [ ] Remove print statements (callers handle output)
 - [ ] Write tests
 
@@ -619,7 +636,7 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 
 **Acceptance Criteria**:
 - Zero hardcoded table names (`"projects"`, `"milestones"`, `"tasks"`) in `backup_restore.py`
-- `backup_restore.py` has zero imports from `db`, `config`, or `adapters` (receives adapter as parameter)
+- `backup_restore.py` has zero bare MC-style imports (`from db import ...`, `from config import ...`, `from adapters import ...`); all imports use `db_adapter.*` package paths
 - `backup_database()` and `restore_database()` are `async def`
 - `BackupSchema` drives table iteration order and FK remapping
 - `validate_backup()` accepts `schema` parameter
@@ -642,20 +659,20 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 - [ ] Redesign `SyncResult` to use dynamic table names (no hardcoded defaults)
 - [ ] `compare_profiles()` accepts `tables`, `user_id`, `user_field`, `slug_field`, `env_prefix` parameters (`env_prefix` allows consuming projects to namespace their env vars, e.g., `env_prefix="MC_"` reads `MC_DB_PROFILE`; default `""` reads `DB_PROFILE`)
 - [ ] `sync_data()` accepts same parameters plus `dry_run`, `confirm`
-- [ ] Replace subprocess-based sync with direct async calls to `backup_database()`/`restore_database()`
+- [ ] Replace `subprocess.run()` calls for backup/restore with direct async calls to `await backup_database()`/`await restore_database()`
 - [ ] Remove `from db import _resolve_url, get_dev_user_id` imports
 - [ ] Generic flat slug resolution (no hierarchical project_slug/slug composition)
-- [ ] Internal adapter creation via `load_db_config` and `_resolve_url` from `db_adapter`
+- [ ] Internal adapter creation via `load_db_config` and `resolve_url` from `db_adapter` (note: `_resolve_url` was renamed to `resolve_url` in Step 4)
 - [ ] Convert to async
 - [ ] Write tests
 
 **Specification**:
-- `SyncResult(BaseModel)`: `source_counts: dict[str, int] = Field(default_factory=dict)`, `dest_counts: dict[str, int] = Field(default_factory=dict)`, `sync_plan: dict[str, dict[str, int]] = Field(default_factory=dict)` -- no hardcoded defaults
-- `async def compare_profiles(source_profile: str, dest_profile: str, tables: list[str], user_id: str, user_field: str = "user_id", slug_field: str = "slug", env_prefix: str = "") -> SyncResult`
-- `async def sync_data(source_profile: str, dest_profile: str, tables: list[str], user_id: str, user_field: str = "user_id", slug_field: str = "slug", env_prefix: str = "", schema: BackupSchema | None = None, dry_run: bool = True, confirm: bool = False) -> SyncResult` — when `schema` is provided, sync uses `backup_database()`/`restore_database()` via temp file; when `None`, sync uses direct `adapter.select()`/`adapter.insert()` per-table operations
+- `SyncResult(BaseModel)`: `source_counts: dict[str, int] = Field(default_factory=dict)`, `dest_counts: dict[str, int] = Field(default_factory=dict)`, `sync_plan: dict[str, dict[str, int]] = Field(default_factory=dict)`, `synced_count: int = 0`, `skipped_count: int = 0`, `errors: list[str] = Field(default_factory=list)` -- no hardcoded defaults
+- `async def compare_profiles(source_profile: str, dest_profile: str, tables: list[str], user_id: str, user_field: str = "user_id", slug_field: str = "slug", env_prefix: str = "") -> SyncResult` -- `env_prefix` is forwarded to `get_active_profile_name()` when resolving the default profile for adapter creation (e.g., `env_prefix="MC_"` reads `MC_DB_PROFILE`)
+- `async def sync_data(source_profile: str, dest_profile: str, tables: list[str], user_id: str, user_field: str = "user_id", slug_field: str = "slug", env_prefix: str = "", schema: BackupSchema | None = None, dry_run: bool = True, confirm: bool = False) -> SyncResult` — **dual-path** (plan refinement extending Design Analysis #9, which only uses backup/restore): when `schema` is provided, sync uses `await backup_database()`/`await restore_database()` via temp file for FK-aware restore; when `None`, sync uses direct `await adapter.select()`/`await adapter.insert()` per-table operations with slug-based matching (inserts rows where slug does not exist in dest, skips existing)
 - `async def _get_data_counts(adapter, user_id, tables, user_field)` iterates `tables` parameter (async — calls `adapter.select()`)
 - `async def _get_slugs(adapter, user_id, tables, slug_field, user_field)` uses flat slug per table, no project_slug/slug composition (async — calls `adapter.select()`). Note: all tables passed to sync functions must use the same `slug_field` column name. If different slug column names are needed, callers should invoke sync per-table group.
-- Internal adapter creation: `from db_adapter.config.loader import load_db_config` and `from db_adapter.factory import _resolve_url` then `AsyncPostgresAdapter(database_url=url)`
+- Internal adapter creation: `from db_adapter.config.loader import load_db_config`, `from db_adapter.factory import resolve_url`, and `from db_adapter.adapters.postgres import AsyncPostgresAdapter` then `AsyncPostgresAdapter(database_url=url)`. Note: `_resolve_url` was renamed to `resolve_url` (public) in Step 4 and will be added to factory `__all__` in Step 13.
 - Backup integration: `from db_adapter.backup.backup_restore import backup_database, restore_database` for sync-via-backup operations
 - Tests must verify: `SyncResult` has no hardcoded table name defaults; `compare_profiles` accepts `tables` parameter; `_get_data_counts` iterates dynamic table list; flat slug resolution
 
@@ -664,8 +681,12 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 - `grep -En "get_dev_user_id|from db import" src/db_adapter/schema/sync.py` returns nothing
 - `SyncResult` field defaults are empty dicts (not pre-populated with table names)
 - `compare_profiles` and `sync_data` are `async def` and accept `tables` parameter
+- `resolve_url` exists in `factory.py` as public API (renamed from `_resolve_url` in Step 4) and used by `sync.py` via `from db_adapter.factory import resolve_url`
 - No subprocess usage (`subprocess.run` removed)
 - Tests pass
+
+**Trade-offs**:
+- **Dual-path sync (direct insert vs backup/restore)**: Direct insert path (when `schema=None`) is simpler and faster for flat tables but has no FK remapping. When a slug conflict occurs on direct insert, the row is silently skipped (same as current behavior). For FK constraint violations on direct insert, `sync_data()` should catch `asyncpg.ForeignKeyViolationError` and raise `ValueError` with a message suggesting the caller provide a `BackupSchema` for FK-aware sync. Partial failures on direct insert: committed rows stay committed (no transaction rollback across tables) — this matches the current behavior and is acceptable for sync's use case.
 
 **Verification**:
 ```bash
@@ -683,27 +704,40 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 - [ ] Change `prog` from `"python -m schema"` to `"db-adapter"`
 - [ ] Change description from "Mission Control" to generic
 - [ ] Update all `cmd_*` functions to call async functions via `asyncio.run()`
-- [ ] Remove MC-specific imports and functions (`get_dev_user_id`, `_show_profile_data` with hardcoded tables)
-- [ ] Remove `get_dev_user_id()` references from CLI (already removed from `factory.py` in Step 4, but CLI may still import/call it)
+- [ ] Remove `get_dev_user_id` import (line 35) and all usages (line 161 in `_show_profile_data()`) -- already removed from `factory.py` in Step 4, so this import is broken
+- [ ] Remove or refactor `_show_profile_data()` (uses hardcoded tables and `get_dev_user_id`)
 - [ ] Remove `from schema.fix import COLUMN_DEFINITIONS` import
 - [ ] Remove hardcoded `fk_drop_order`/`fk_create_order` dicts with MC table names
 - [ ] Update all MC_DB_PROFILE references in help text to use generic env prefix
 - [ ] Generalize `_show_profile_comparison()` and `_show_profile_data()` to not use hardcoded table names (or remove data display)
+- [ ] Implement `_parse_expected_columns(schema_file)` helper to parse CREATE TABLE SQL into `dict[str, set[str]]`
 - [ ] Update `cmd_fix()` to work with the new `generate_fix_plan()` signature; add `--schema-file` and `--column-defs` arguments to the fix subparser
+- [ ] Remove subprocess-based backup call in `cmd_fix()` (lines 536-547 invoking `backup/backup_cli.py`); replace with `backup_fn` callback to `apply_fixes()`
 - [ ] Update `cmd_sync()` to accept `--tables` argument instead of hardcoding tables
+- [ ] Add `--user-id` argument to `cmd_sync()` (required by Step 11's `compare_profiles()`/`sync_data()` signatures)
 - [ ] Add `--env-prefix` global option
 - [ ] Convert any remaining bare imports in CLI files to `db_adapter.*` package imports (complements Step 2's conversion)
 - [ ] Update `cli/backup.py` imports to use `db_adapter.backup.backup_restore`
+- [ ] Remove "Mission Control" from `cli/backup.py` docstring (line 2) and argparse description (line 120); replace with generic text (e.g., "Database backup and restore CLI")
 - [ ] Keep `cli/backup.py` as separate unregistered submodule; update its imports to `db_adapter.*` paths only — do NOT register backup commands from `cli/__init__.py` (deferred to consuming projects per design analysis #11, since CLI cannot know caller's BackupSchema at runtime)
 - [ ] Write tests
 
 **Specification**:
 - `main()`: `argparse.ArgumentParser(prog="db-adapter", description="Database schema management and adapter toolkit")`
-- Each `cmd_*` function wraps async with pattern: `def cmd_connect(args): return asyncio.run(_async_connect(args))`
-- `cmd_fix()`: accepts `--schema-file` (path to SQL schema file) and `--column-defs` (path to JSON file mapping `table.column` to SQL type definition) arguments; delegates FK ordering to `FixPlan.drop_order`/`create_order` (no hardcoded `fk_drop_order`/`fk_create_order` dicts). Call pattern: `result = await connect_and_validate(..., expected_columns=expected); plan = generate_fix_plan(result.validation, column_defs, schema_file); await apply_fixes(adapter, plan, ...)`
-- `cmd_sync()`: accepts `--tables` argument (required, comma-separated list e.g. `--tables projects,milestones,tasks`); passes to `compare_profiles()`/`sync_data()`
+- Each `cmd_*` function that makes database calls wraps async with the same pattern: `def cmd_<name>(args): return asyncio.run(_async_<name>(args))`. Apply to: `cmd_connect`, `cmd_validate`, `cmd_fix`, `cmd_sync`. Each gets a corresponding `async def _async_<name>(args)` implementation. Note: `cmd_status` and `cmd_profiles` remain sync — they only read local files (lock file, TOML config) and make no database calls.
+- `cmd_fix()`: accepts `--schema-file` (required, path to SQL file containing CREATE TABLE statements) and `--column-defs` (required, path to JSON file mapping `"table.column"` to SQL type definition string) arguments. JSON format example:
+  ```json
+  {
+    "users.email": "TEXT NOT NULL",
+    "users.status": "TEXT NOT NULL DEFAULT 'active'",
+    "orders.total": "NUMERIC(10,2) NOT NULL DEFAULT 0"
+  }
+  ```
+  CLI reads and parses this file via `json.load()`; delegates FK ordering to `FixPlan.drop_order`/`create_order` (no hardcoded `fk_drop_order`/`fk_create_order` dicts). CLI derives `expected_columns` by parsing CREATE TABLE statements from `--schema-file` to extract `dict[str, set[str]]` of table -> column sets. Call pattern: `expected = _parse_expected_columns(schema_file); result = await connect_and_validate(..., expected_columns=expected); plan = generate_fix_plan(result.schema_report, column_defs, schema_file); await apply_fixes(adapter, plan, ...)`
+- `_parse_expected_columns(schema_file: str | Path) -> dict[str, set[str]]`: parses CREATE TABLE statements from the SQL file, extracts table names and column names, returns `{table_name: {col1, col2, ...}}`. Implementation: read file, regex-match `CREATE TABLE (\w+)` blocks, extract column names from each column definition line (first word of each line between parentheses). Raises `ValueError` if no CREATE TABLE statements found. This is a CLI-internal helper (not exported).
+- `cmd_sync()`: accepts `--tables` argument (required, comma-separated list e.g. `--tables projects,milestones,tasks`) and `--user-id` argument (required, user ID string); parsed via `tables = args.tables.split(",")` and passed to `compare_profiles()`/`sync_data()` along with `user_id=args.user_id`
 - All help text: `DB_PROFILE=<name> db-adapter connect` (no `MC_` prefix in help; actual prefix configurable via `--env-prefix`). Rename all internal `MC_DB_PROFILE` references to generic `DB_PROFILE` — consuming projects use `--env-prefix MC_` to get `MC_DB_PROFILE` behavior.
-- `_show_profile_data()` and `_show_profile_comparison()`: removed or refactored to not hardcode table names (accept tables as parameter or omit data count display)
+- `_show_profile_data()` and `_show_profile_comparison()`: removed. Data count display requires DB queries that belong in `cmd_status` or `cmd_sync`, not in helpers that assume table names.
 - `cli/backup.py` imports updated to `from db_adapter.backup.backup_restore import ...`
 - Tests must verify: parser prog is `"db-adapter"`; no `"Mission Control"` string in CLI code; `--env-prefix` option exists; `cmd_connect` wraps async
 
@@ -715,6 +749,10 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 - All `cmd_*` functions wrap async calls via `asyncio.run()`
 - `grep -E "COLUMN_DEFINITIONS|fk_drop_order|fk_create_order" src/db_adapter/cli/__init__.py` returns nothing
 - Tests pass
+
+**Trade-offs**:
+- **`cli/backup.py` as separate module vs integrated**: Kept as separate unregistered module because CLI cannot know caller's `BackupSchema` at runtime. Consuming projects wire backup commands in their own CLI. Alternative: register backup commands with a `--schema-file` argument — adds complexity without clear benefit.
+- **`asyncio.run()` per-command vs shared event loop**: Per-command `asyncio.run()` is simpler and isolates each command's async lifecycle. Alternative: single event loop with `loop.run_until_complete()` — unnecessary complexity for a CLI that runs one command per invocation.
 
 **Verification**:
 ```bash
@@ -741,7 +779,7 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 - `src/db_adapter/__init__.py` exports:
   - `DatabaseClient` from `adapters.base`
   - `AsyncPostgresAdapter` from `adapters.postgres`
-  - `get_adapter`, `connect_and_validate`, `ProfileNotFoundError` from `factory`
+  - `get_adapter`, `connect_and_validate`, `ProfileNotFoundError`, `resolve_url` from `factory`
   - `load_db_config` from `config.loader`
   - `DatabaseProfile`, `DatabaseConfig` from `config.models`
   - `validate_schema` from `schema.comparator`
@@ -751,14 +789,14 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 - Subpackage `__all__` exports:
   - `adapters/__init__.py`: `["DatabaseClient", "AsyncPostgresAdapter"]` (+ conditional `"AsyncSupabaseAdapter"`)
   - `config/__init__.py`: `["load_db_config", "DatabaseProfile", "DatabaseConfig"]`
-  - `schema/__init__.py`: `["validate_schema", "SchemaIntrospector", "SchemaValidationResult", "ColumnDiff", "ConnectionResult", "ColumnSchema", "ConstraintSchema", "IndexSchema", "TriggerSchema", "FunctionSchema", "TableSchema", "DatabaseSchema"]`
+  - `schema/__init__.py`: `["validate_schema", "SchemaIntrospector", "SchemaValidationResult", "ColumnDiff", "ConnectionResult", "ColumnSchema", "ConstraintSchema", "IndexSchema", "TriggerSchema", "FunctionSchema", "TableSchema", "DatabaseSchema", "compare_profiles", "sync_data", "SyncResult", "generate_fix_plan", "apply_fixes", "FixPlan", "FixResult", "ColumnFix", "TableFix"]`
   - `backup/__init__.py`: `["BackupSchema", "TableDef", "ForeignKey", "backup_database", "restore_database", "validate_backup"]`
 - Tests must verify: `from db_adapter import AsyncPostgresAdapter, DatabaseClient, get_adapter` works; `from db_adapter import BackupSchema, TableDef, ForeignKey` works; `from db_adapter import validate_schema, load_db_config` works; optional `AsyncSupabaseAdapter` does not error when supabase not installed
 
 **Acceptance Criteria**:
 - `uv run python -c "from db_adapter import AsyncPostgresAdapter, DatabaseClient, get_adapter, connect_and_validate"` succeeds
 - `uv run python -c "from db_adapter import BackupSchema, TableDef, ForeignKey, load_db_config"` succeeds
-- `uv run python -c "from db_adapter import DatabaseProfile, DatabaseConfig, validate_schema, ProfileNotFoundError"` succeeds
+- `uv run python -c "from db_adapter import DatabaseProfile, DatabaseConfig, validate_schema, ProfileNotFoundError, resolve_url"` succeeds
 - Each `__init__.py` has an `__all__` list
 - `from db_adapter import X` works for every name in the top-level `__all__` list
 - Tests pass
@@ -784,7 +822,7 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 
 **Specification**:
 - Run all test files created across steps 1-13
-- Run grep checks for forbidden patterns: `fastmcp`, `creational.common`, `mcp.server.auth`, `schema.db_models`
+- Run grep checks for forbidden patterns: `fastmcp`, `creational.common`, `mcp.server`, `schema.db_models`
 - Grep for hardcoded MC table names: `"projects"`, `"milestones"`, `"tasks"` as string literals in library code (not test code) — these should be parameterized via `BackupSchema`/`tables` arguments
 - Verify `uv sync` succeeds cleanly
 - Verify CLI entry point works
@@ -792,7 +830,8 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 
 **Acceptance Criteria**:
 - All tests from steps 1-13 pass (full suite)
-- `grep -rEn "from fastmcp|from creational|from mcp.server|from schema.db_models|import fastmcp|import creational|import mcp\.server" src/db_adapter/` returns nothing (catches both `from X import Y` and bare `import X` forms)
+- `grep -rEn "from fastmcp|from creational|from mcp.server|from schema.db_models|import fastmcp|import creational|import mcp\.server|import schema\.db_models" src/db_adapter/` returns nothing (catches both `from X import Y` and bare `import X` forms)
+- `grep -rn "# REMOVED:" src/db_adapter/` returns nothing (no orphaned `# REMOVED:` comments from Step 2's import strategy)
 - `grep -rEn '"projects"|"milestones"|"tasks"' src/db_adapter/ --include="*.py"` returns nothing (no hardcoded MC table names)
 - `uv run python -c "from db_adapter import AsyncPostgresAdapter, DatabaseClient, get_adapter"` succeeds
 - `uv run db-adapter --help` shows program name as `db-adapter`
@@ -804,7 +843,10 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 cd /Users/docchang/Development/db-adapter && uv run pytest tests/ -v --tb=short
 
 # Verify no MC-specific imports (both 'from X import Y' and 'import X' forms)
-grep -rEn "from fastmcp|from creational|from mcp.server|from schema.db_models|import fastmcp|import creational|import mcp\.server" src/db_adapter/
+grep -rEn "from fastmcp|from creational|from mcp.server|from schema.db_models|import fastmcp|import creational|import mcp\.server|import schema\.db_models" src/db_adapter/
+
+# Verify no orphaned REMOVED: comments (from Step 2's import strategy)
+grep -rn "# REMOVED:" src/db_adapter/
 
 # Verify no hardcoded MC table names
 grep -rEn '"projects"|"milestones"|"tasks"' src/db_adapter/ --include="*.py"
@@ -817,11 +859,12 @@ cd /Users/docchang/Development/db-adapter && uv run db-adapter --help
 
 # Verify imports (includes circular import check via importing all subpackages)
 cd /Users/docchang/Development/db-adapter && uv run python -c "
-from db_adapter import AsyncPostgresAdapter, DatabaseClient, get_adapter, connect_and_validate, BackupSchema
+from db_adapter import AsyncPostgresAdapter, DatabaseClient, get_adapter, connect_and_validate, BackupSchema, ProfileNotFoundError, resolve_url
 from db_adapter.adapters import DatabaseClient, AsyncPostgresAdapter
 from db_adapter.config import load_db_config, DatabaseProfile, DatabaseConfig
 from db_adapter.schema import validate_schema, SchemaIntrospector
-from db_adapter.backup import BackupSchema, TableDef, ForeignKey
+from db_adapter.backup import BackupSchema, TableDef, ForeignKey, backup_database, restore_database, validate_backup
+from db_adapter.schema import compare_profiles, sync_data, generate_fix_plan, apply_fixes
 print('All imports OK — no circular import issues')
 "
 ```
@@ -864,8 +907,8 @@ print('All imports OK — no circular import issues')
 cd /Users/docchang/Development/db-adapter && uv run pytest tests/ -v --tb=short
 # Expected: All pass
 
-# 2. No MC-specific imports remain
-grep -rEn "from fastmcp|from creational|from mcp.server|from schema.db_models" src/db_adapter/
+# 2. No MC-specific imports remain (both 'from X import Y' and 'import X' forms)
+grep -rEn "from fastmcp|from creational|from mcp.server|from schema.db_models|import fastmcp|import creational|import mcp\.server|import schema\.db_models" src/db_adapter/
 # Expected: No output (zero matches)
 
 # 3. Top-level imports work
@@ -899,7 +942,7 @@ cd /Users/docchang/Development/db-adapter && uv run db-adapter --help
 | `src/db_adapter/schema/fix.py` | Modify | Remove COLUMN_DEFINITIONS, parameterize, async |
 | `src/db_adapter/schema/sync.py` | Modify | Remove hardcoded tables, parameterize, async |
 | `src/db_adapter/backup/__init__.py` | Modify | Add exports |
-| `src/db_adapter/backup/models.py` | No change | Already generic |
+| `src/db_adapter/backup/models.py` | Modify | Update docstring example to use generic table names (replace MC-specific `projects`/`milestones`/`tasks` references) |
 | `src/db_adapter/backup/backup_restore.py` | Modify | Use BackupSchema, remove MC imports, async |
 | `src/db_adapter/cli/__init__.py` | Modify | Rename to db-adapter, remove MC refs, asyncio.run |
 | `src/db_adapter/cli/backup.py` | Modify | Update imports to db_adapter paths |

@@ -1,4 +1,4 @@
-"""PostgreSQL schema introspection via information_schema.
+"""PostgreSQL schema introspection via information_schema (async).
 
 This module queries the live database to extract schema information:
 - Tables, columns, data types, nullability, defaults
@@ -7,13 +7,31 @@ This module queries the live database to extract schema information:
 - Triggers (name, event, timing, function)
 - Functions (name, return type, definition)
 
-Uses psycopg (v3) for PostgreSQL connections.
+Uses psycopg v3 AsyncConnection for async PostgreSQL connections.
+
+Usage:
+    async with SchemaIntrospector(database_url) as introspector:
+        # Verify connection is alive
+        alive = await introspector.test_connection()
+
+        # Get full schema (tables, columns, constraints, indexes, triggers)
+        schema = await introspector.introspect()
+
+        # Or just get column names for validation
+        columns = await introspector.get_column_names()
+
+    # With custom excluded tables and connect timeout:
+    async with SchemaIntrospector(
+        database_url,
+        excluded_tables={"migrations", "pg_stat_statements"},
+        connect_timeout=30,
+    ) as introspector:
+        schema = await introspector.introspect()
 """
 
 import psycopg
-from psycopg import Connection
 
-from schema.models import (
+from db_adapter.schema.models import (
     ColumnSchema,
     ConstraintSchema,
     IndexSchema,
@@ -25,117 +43,157 @@ from schema.models import (
 
 
 class SchemaIntrospector:
-    """Introspects PostgreSQL database schema.
+    """Introspects PostgreSQL database schema asynchronously.
 
     Uses information_schema and pg_catalog for comprehensive schema extraction.
     Works with any PostgreSQL database (RDS, Supabase, local).
 
     Usage:
-        with SchemaIntrospector(database_url) as introspector:
+        async with SchemaIntrospector(database_url) as introspector:
             # Get full schema (tables, columns, constraints, indexes, triggers)
-            schema = introspector.introspect()
+            schema = await introspector.introspect()
 
             # Or just get column names for validation
-            columns = introspector.get_column_names()
+            columns = await introspector.get_column_names()
     """
 
-    # Tables to exclude from introspection (system tables)
-    EXCLUDED_TABLES = {
+    # Default tables to exclude from introspection (system tables)
+    EXCLUDED_TABLES_DEFAULT: set[str] = {
         "schema_migrations",
         "pg_stat_statements",
         "spatial_ref_sys",
     }
 
-    def __init__(self, database_url: str):
+    def __init__(
+        self,
+        database_url: str,
+        excluded_tables: set[str] | None = None,
+        connect_timeout: int = 10,
+    ) -> None:
         """Initialize with database connection URL.
 
         Args:
-            database_url: PostgreSQL connection URL
+            database_url: PostgreSQL connection URL.
+            excluded_tables: Tables to exclude from introspection.
+                Defaults to EXCLUDED_TABLES_DEFAULT if None.
+            connect_timeout: Connection timeout in seconds. Defaults to 10.
         """
         self._database_url = database_url
-        self._conn: Connection | None = None
+        self._excluded_tables: set[str] = (
+            excluded_tables if excluded_tables is not None else self.EXCLUDED_TABLES_DEFAULT.copy()
+        )
+        self._connect_timeout: int = connect_timeout
+        self._conn: psycopg.AsyncConnection | None = None
 
-    def __enter__(self) -> "SchemaIntrospector":
-        """Context manager entry - opens connection."""
-        # Append connect_timeout if not already in URL
-        url = self._database_url
-        if "connect_timeout" not in url:
-            separator = "&" if "?" in url else "?"
-            url = f"{url}{separator}connect_timeout=10"
-
-        self._conn = psycopg.connect(url)
+    async def __aenter__(self) -> "SchemaIntrospector":
+        """Async context manager entry -- opens async connection."""
+        self._conn = await psycopg.AsyncConnection.connect(
+            self._database_url,
+            connect_timeout=self._connect_timeout,
+        )
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Context manager exit - closes connection."""
+    async def __aexit__(self, exc_type: type | None, exc_val: BaseException | None, exc_tb: object) -> None:
+        """Async context manager exit -- closes connection."""
         if self._conn:
-            self._conn.close()
+            await self._conn.close()
             self._conn = None
 
-    def introspect(self, schema_name: str = "public") -> DatabaseSchema:
+    async def test_connection(self) -> bool:
+        """Test that the database connection is alive.
+
+        Runs ``SELECT 1`` via async cursor on the already-open connection.
+
+        Returns:
+            True if the connection is alive.
+
+        Raises:
+            RuntimeError: If the introspector is not connected.
+            ConnectionError: If the connection test fails.
+        """
+        if not self._conn:
+            raise RuntimeError("Introspector not connected. Use 'async with' statement.")
+
+        try:
+            async with self._conn.cursor() as cur:
+                await cur.execute("SELECT 1")
+                result = await cur.fetchone()
+                if result and result[0] == 1:
+                    return True
+                raise ConnectionError("Connection test returned unexpected result")
+        except psycopg.Error as e:
+            raise ConnectionError(f"Connection test failed: {e}") from e
+
+    async def introspect(self, schema_name: str = "public") -> DatabaseSchema:
         """Introspect full database schema.
 
         Args:
-            schema_name: PostgreSQL schema to introspect (default: public)
+            schema_name: PostgreSQL schema to introspect (default: public).
 
         Returns:
             DatabaseSchema with all tables, columns, constraints, etc.
+
+        Raises:
+            RuntimeError: If the introspector is not connected.
         """
         if not self._conn:
-            raise RuntimeError("Introspector not connected. Use with statement.")
+            raise RuntimeError("Introspector not connected. Use 'async with' statement.")
 
         db_schema = DatabaseSchema()
 
         # Get tables
-        tables = self._get_tables(schema_name)
+        tables = await self._get_tables(schema_name)
 
         for table_name in tables:
-            if table_name in self.EXCLUDED_TABLES:
+            if table_name in self._excluded_tables:
                 continue
 
             table = TableSchema(name=table_name)
 
             # Get columns
-            table.columns = self._get_columns(schema_name, table_name)
+            table.columns = await self._get_columns(schema_name, table_name)
 
             # Get constraints
-            table.constraints = self._get_constraints(schema_name, table_name)
+            table.constraints = await self._get_constraints(schema_name, table_name)
 
             # Get indexes
-            table.indexes = self._get_indexes(schema_name, table_name)
+            table.indexes = await self._get_indexes(schema_name, table_name)
 
             # Get triggers
-            table.triggers = self._get_triggers(schema_name, table_name)
+            table.triggers = await self._get_triggers(schema_name, table_name)
 
             db_schema.tables[table_name] = table
 
         # Get functions
-        db_schema.functions = self._get_functions(schema_name)
+        db_schema.functions = await self._get_functions(schema_name)
 
         return db_schema
 
-    def get_column_names(self, schema_name: str = "public") -> dict[str, set[str]]:
+    async def get_column_names(self, schema_name: str = "public") -> dict[str, set[str]]:
         """Get column names for all tables (simplified for comparator).
 
         This is a lightweight alternative to full introspection when you only
         need to check if expected columns exist.
 
         Args:
-            schema_name: PostgreSQL schema to query (default: public)
+            schema_name: PostgreSQL schema to query (default: public).
 
         Returns:
-            Dict mapping table name to set of column names
+            Dict mapping table name to set of column names.
+
+        Raises:
+            RuntimeError: If the introspector is not connected.
         """
         if not self._conn:
-            raise RuntimeError("Introspector not connected. Use with statement.")
+            raise RuntimeError("Introspector not connected. Use 'async with' statement.")
 
         result: dict[str, set[str]] = {}
 
         # Get all tables
-        tables = self._get_tables(schema_name)
+        tables = await self._get_tables(schema_name)
 
         for table_name in tables:
-            if table_name in self.EXCLUDED_TABLES:
+            if table_name in self._excluded_tables:
                 continue
 
             # Query just column names (no types, defaults, etc.)
@@ -145,13 +203,14 @@ class SchemaIntrospector:
                 WHERE table_schema = %s
                   AND table_name = %s
             """
-            with self._conn.cursor() as cur:
-                cur.execute(query, (schema_name, table_name))
-                result[table_name] = {row[0] for row in cur.fetchall()}
+            async with self._conn.cursor() as cur:
+                await cur.execute(query, (schema_name, table_name))
+                rows = await cur.fetchall()
+                result[table_name] = {row[0] for row in rows}
 
         return result
 
-    def _get_tables(self, schema_name: str) -> list[str]:
+    async def _get_tables(self, schema_name: str) -> list[str]:
         """Get all table names in schema."""
         query = """
             SELECT table_name
@@ -160,11 +219,12 @@ class SchemaIntrospector:
               AND table_type = 'BASE TABLE'
             ORDER BY table_name
         """
-        with self._conn.cursor() as cur:
-            cur.execute(query, (schema_name,))
-            return [row[0] for row in cur.fetchall()]
+        async with self._conn.cursor() as cur:
+            await cur.execute(query, (schema_name,))
+            rows = await cur.fetchall()
+            return [row[0] for row in rows]
 
-    def _get_columns(self, schema_name: str, table_name: str) -> dict[str, ColumnSchema]:
+    async def _get_columns(self, schema_name: str, table_name: str) -> dict[str, ColumnSchema]:
         """Get columns for a table."""
         query = """
             SELECT
@@ -177,10 +237,11 @@ class SchemaIntrospector:
               AND table_name = %s
             ORDER BY ordinal_position
         """
-        with self._conn.cursor() as cur:
-            cur.execute(query, (schema_name, table_name))
-            columns = {}
-            for row in cur.fetchall():
+        async with self._conn.cursor() as cur:
+            await cur.execute(query, (schema_name, table_name))
+            rows = await cur.fetchall()
+            columns: dict[str, ColumnSchema] = {}
+            for row in rows:
                 col_name, data_type, is_nullable, default = row
                 columns[col_name] = ColumnSchema(
                     name=col_name,
@@ -194,6 +255,7 @@ class SchemaIntrospector:
         """Normalize PostgreSQL data type names.
 
         Maps verbose information_schema types to standard names.
+        This is pure logic with no I/O -- stays synchronous.
         """
         type_map = {
             "character varying": "varchar",
@@ -205,7 +267,7 @@ class SchemaIntrospector:
         }
         return type_map.get(data_type.lower(), data_type.lower())
 
-    def _get_constraints(
+    async def _get_constraints(
         self, schema_name: str, table_name: str
     ) -> dict[str, ConstraintSchema]:
         """Get constraints for a table."""
@@ -230,13 +292,14 @@ class SchemaIntrospector:
               AND tc.table_name = %s
             ORDER BY tc.constraint_name, kcu.ordinal_position
         """
-        with self._conn.cursor() as cur:
-            cur.execute(query, (schema_name, table_name))
+        async with self._conn.cursor() as cur:
+            await cur.execute(query, (schema_name, table_name))
+            rows = await cur.fetchall()
 
             constraints: dict[str, ConstraintSchema] = {}
             constraint_columns: dict[str, list[str]] = {}
 
-            for row in cur.fetchall():
+            for row in rows:
                 (
                     name,
                     ctype,
@@ -266,7 +329,7 @@ class SchemaIntrospector:
 
             return constraints
 
-    def _get_indexes(self, schema_name: str, table_name: str) -> dict[str, IndexSchema]:
+    async def _get_indexes(self, schema_name: str, table_name: str) -> dict[str, IndexSchema]:
         """Get indexes for a table (excluding primary key)."""
         query = """
             SELECT
@@ -287,10 +350,11 @@ class SchemaIntrospector:
             GROUP BY i.relname, ix.indisunique, am.amname
             ORDER BY i.relname
         """
-        with self._conn.cursor() as cur:
-            cur.execute(query, (schema_name, table_name))
-            indexes = {}
-            for row in cur.fetchall():
+        async with self._conn.cursor() as cur:
+            await cur.execute(query, (schema_name, table_name))
+            rows = await cur.fetchall()
+            indexes: dict[str, IndexSchema] = {}
+            for row in rows:
                 name, columns, is_unique, idx_type = row
                 indexes[name] = IndexSchema(
                     name=name,
@@ -300,7 +364,7 @@ class SchemaIntrospector:
                 )
             return indexes
 
-    def _get_triggers(self, schema_name: str, table_name: str) -> dict[str, TriggerSchema]:
+    async def _get_triggers(self, schema_name: str, table_name: str) -> dict[str, TriggerSchema]:
         """Get triggers for a table."""
         query = """
             SELECT
@@ -312,10 +376,11 @@ class SchemaIntrospector:
             WHERE trigger_schema = %s
               AND event_object_table = %s
         """
-        with self._conn.cursor() as cur:
-            cur.execute(query, (schema_name, table_name))
-            triggers = {}
-            for row in cur.fetchall():
+        async with self._conn.cursor() as cur:
+            await cur.execute(query, (schema_name, table_name))
+            rows = await cur.fetchall()
+            triggers: dict[str, TriggerSchema] = {}
+            for row in rows:
                 name, event, timing, statement = row
                 # Extract function name from statement like "EXECUTE FUNCTION func_name()"
                 func_name = ""
@@ -336,7 +401,7 @@ class SchemaIntrospector:
                 )
             return triggers
 
-    def _get_functions(self, schema_name: str) -> dict[str, FunctionSchema]:
+    async def _get_functions(self, schema_name: str) -> dict[str, FunctionSchema]:
         """Get user-defined functions in schema.
 
         Note: Uses prokind = 'f' to filter for regular functions (PostgreSQL 11+).
@@ -358,10 +423,11 @@ class SchemaIntrospector:
               )
             ORDER BY p.proname
         """
-        with self._conn.cursor() as cur:
-            cur.execute(query, (schema_name,))
-            functions = {}
-            for row in cur.fetchall():
+        async with self._conn.cursor() as cur:
+            await cur.execute(query, (schema_name,))
+            rows = await cur.fetchall()
+            functions: dict[str, FunctionSchema] = {}
+            for row in rows:
                 name, return_type, definition = row
                 functions[name] = FunctionSchema(
                     name=name,
