@@ -1,6 +1,6 @@
 [project]
 name = "db-adapter"
-version = "0.1.0"
+version = "0.1.1"
 description = "Async dict-based database adapter with Protocol typing, multi-profile config, schema management CLI, and backup/restore."
 readme = "README.md"
 license = "MIT"

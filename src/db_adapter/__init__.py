@@ -10,7 +10,7 @@ Usage:
     from db_adapter import DatabaseProfile, DatabaseConfig
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # Adapters
 from db_adapter.adapters.base import DatabaseClient
