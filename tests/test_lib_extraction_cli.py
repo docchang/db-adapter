@@ -13,6 +13,7 @@ Verifies that the CLI module:
 - ``cli/backup.py`` has no MC-specific references
 """
 
+import argparse
 import ast
 import asyncio
 import inspect
@@ -23,6 +24,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from db_adapter.cli import (
+    _async_connect,
+    _async_fix,
+    _async_sync,
+    _async_validate,
     _parse_expected_columns,
     cmd_connect,
     cmd_fix,
@@ -328,12 +333,16 @@ class TestCLIArguments:
                 main()
             assert exc_info.value.code == 2
 
-    def test_fix_parser_requires_schema_file(self):
-        """fix command requires --schema-file argument."""
+    def test_fix_parser_schema_file_is_optional(self):
+        """fix command does not require --schema-file (defaults to None,
+        falls back to config at runtime)."""
         with patch("sys.argv", ["db-adapter", "fix", "--column-defs", "d.json"]):
-            with pytest.raises(SystemExit) as exc_info:
-                main()
-            assert exc_info.value.code == 2
+            with patch("db_adapter.cli.cmd_fix", return_value=0) as mock_fix:
+                result = main()
+        assert result == 0
+        call_args = mock_fix.call_args[0][0]
+        assert call_args.schema_file is None
+        assert call_args.column_defs == "d.json"
 
     def test_fix_parser_requires_column_defs(self):
         """fix command requires --column-defs argument."""
@@ -425,6 +434,35 @@ class TestParseExpectedColumns:
         with pytest.raises(FileNotFoundError):
             _parse_expected_columns(tmp_path / "nonexistent.sql")
 
+    def test_uppercase_identifiers(self, tmp_path):
+        """Uppercase table and column names are returned as lowercase."""
+        schema = tmp_path / "schema.sql"
+        schema.write_text(textwrap.dedent("""\
+            CREATE TABLE ITEMS (
+                A TEXT PRIMARY KEY,
+                B TEXT NOT NULL
+            );
+        """))
+
+        result = _parse_expected_columns(schema)
+        assert "items" in result
+        assert result["items"] == {"a", "b"}
+
+    def test_mixed_case_identifiers(self, tmp_path):
+        """Mixed-case table and column names are returned as lowercase."""
+        schema = tmp_path / "schema.sql"
+        schema.write_text(textwrap.dedent("""\
+            CREATE TABLE Items (
+                Id TEXT PRIMARY KEY,
+                NAME TEXT NOT NULL,
+                createdAt TIMESTAMP DEFAULT NOW()
+            );
+        """))
+
+        result = _parse_expected_columns(schema)
+        assert "items" in result
+        assert result["items"] == {"id", "name", "createdat"}
+
     def test_no_create_table(self, tmp_path):
         """Raises ValueError when no CREATE TABLE found."""
         schema = tmp_path / "empty.sql"
@@ -432,6 +470,960 @@ class TestParseExpectedColumns:
 
         with pytest.raises(ValueError, match="No CREATE TABLE"):
             _parse_expected_columns(schema)
+
+
+# ------------------------------------------------------------------
+# _async_connect config-driven validation
+# ------------------------------------------------------------------
+
+
+class TestAsyncConnectConfigDriven:
+    """Tests for config-driven schema validation in _async_connect()."""
+
+    def _make_connection_result(
+        self,
+        *,
+        success: bool = True,
+        profile_name: str = "dev",
+        schema_valid: bool | None = None,
+        schema_report: object | None = None,
+        error: str | None = None,
+    ) -> MagicMock:
+        """Create a mock ConnectionResult with the given fields."""
+        result = MagicMock()
+        result.success = success
+        result.profile_name = profile_name
+        result.schema_valid = schema_valid
+        result.schema_report = schema_report
+        result.error = error
+        return result
+
+    def test_validate_on_connect_true_with_schema_file(self, tmp_path):
+        """Config with validate_on_connect=True and valid schema file
+        calls connect_and_validate with expected_columns."""
+        schema = tmp_path / "schema.sql"
+        schema.write_text(
+            "CREATE TABLE users (\n"
+            "    id TEXT PRIMARY KEY,\n"
+            "    email TEXT NOT NULL\n"
+            ");\n"
+        )
+
+        mock_config = MagicMock()
+        mock_config.validate_on_connect = True
+        mock_config.schema_file = str(schema)
+
+        mock_result = self._make_connection_result(
+            success=True,
+            profile_name="dev",
+            schema_valid=True,
+        )
+
+        args = argparse.Namespace(env_prefix="")
+
+        with (
+            patch("db_adapter.cli.load_db_config", return_value=mock_config),
+            patch("db_adapter.cli.read_profile_lock", return_value=None),
+            patch(
+                "db_adapter.cli.connect_and_validate",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ) as mock_connect,
+        ):
+            rc = asyncio.run(_async_connect(args))
+
+        assert rc == 0
+        # Verify expected_columns was passed
+        call_kwargs = mock_connect.call_args[1]
+        assert "expected_columns" in call_kwargs
+        assert call_kwargs["expected_columns"] == {"users": {"id", "email"}}
+
+    def test_validate_on_connect_false(self):
+        """Config with validate_on_connect=False calls connect_and_validate
+        without expected_columns."""
+        mock_config = MagicMock()
+        mock_config.validate_on_connect = False
+
+        mock_result = self._make_connection_result(
+            success=True,
+            profile_name="dev",
+            schema_valid=None,
+        )
+
+        args = argparse.Namespace(env_prefix="")
+
+        with (
+            patch("db_adapter.cli.load_db_config", return_value=mock_config),
+            patch("db_adapter.cli.read_profile_lock", return_value=None),
+            patch(
+                "db_adapter.cli.connect_and_validate",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ) as mock_connect,
+        ):
+            rc = asyncio.run(_async_connect(args))
+
+        assert rc == 0
+        # Verify expected_columns was NOT passed (is None)
+        call_kwargs = mock_connect.call_args[1]
+        assert call_kwargs["expected_columns"] is None
+
+    def test_missing_db_toml_still_connects(self):
+        """Missing db.toml (FileNotFoundError from load_db_config) still
+        connects successfully in connect-only mode."""
+        mock_result = self._make_connection_result(
+            success=True,
+            profile_name="dev",
+            schema_valid=None,
+        )
+
+        args = argparse.Namespace(env_prefix="")
+
+        with (
+            patch(
+                "db_adapter.cli.load_db_config",
+                side_effect=FileNotFoundError("db.toml not found"),
+            ),
+            patch("db_adapter.cli.read_profile_lock", return_value=None),
+            patch(
+                "db_adapter.cli.connect_and_validate",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ) as mock_connect,
+        ):
+            rc = asyncio.run(_async_connect(args))
+
+        assert rc == 0
+        # Verify expected_columns was NOT passed (is None)
+        call_kwargs = mock_connect.call_args[1]
+        assert call_kwargs["expected_columns"] is None
+
+    def test_missing_schema_file_still_connects(self, tmp_path):
+        """Missing schema file (FileNotFoundError from _parse_expected_columns)
+        still connects, with validation skipped."""
+        mock_config = MagicMock()
+        mock_config.validate_on_connect = True
+        mock_config.schema_file = str(tmp_path / "nonexistent.sql")
+
+        mock_result = self._make_connection_result(
+            success=True,
+            profile_name="dev",
+            schema_valid=None,
+        )
+
+        args = argparse.Namespace(env_prefix="")
+
+        with (
+            patch("db_adapter.cli.load_db_config", return_value=mock_config),
+            patch("db_adapter.cli.read_profile_lock", return_value=None),
+            patch(
+                "db_adapter.cli.connect_and_validate",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ) as mock_connect,
+        ):
+            rc = asyncio.run(_async_connect(args))
+
+        assert rc == 0
+        call_kwargs = mock_connect.call_args[1]
+        assert call_kwargs["expected_columns"] is None
+
+    def test_schema_validation_passed_message(self, tmp_path, capsys):
+        """'Schema validation: PASSED' only prints when validation actually
+        occurred and passed (schema_valid is True)."""
+        schema = tmp_path / "schema.sql"
+        schema.write_text(
+            "CREATE TABLE users (\n"
+            "    id TEXT PRIMARY KEY\n"
+            ");\n"
+        )
+
+        mock_config = MagicMock()
+        mock_config.validate_on_connect = True
+        mock_config.schema_file = str(schema)
+
+        mock_result = self._make_connection_result(
+            success=True,
+            profile_name="dev",
+            schema_valid=True,
+        )
+
+        args = argparse.Namespace(env_prefix="")
+
+        with (
+            patch("db_adapter.cli.load_db_config", return_value=mock_config),
+            patch("db_adapter.cli.read_profile_lock", return_value=None),
+            patch(
+                "db_adapter.cli.connect_and_validate",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ),
+            patch("db_adapter.cli.console") as mock_console,
+        ):
+            rc = asyncio.run(_async_connect(args))
+
+        assert rc == 0
+        # Find the call that contains "PASSED"
+        printed = [str(call) for call in mock_console.print.call_args_list]
+        assert any("PASSED" in s for s in printed), (
+            "Expected 'PASSED' in output when schema_valid is True"
+        )
+
+    def test_no_passed_message_when_validation_skipped(self):
+        """'Schema validation: PASSED' does NOT print when validation was
+        skipped (schema_valid is None)."""
+        mock_result = self._make_connection_result(
+            success=True,
+            profile_name="dev",
+            schema_valid=None,
+        )
+
+        args = argparse.Namespace(env_prefix="")
+
+        with (
+            patch(
+                "db_adapter.cli.load_db_config",
+                side_effect=FileNotFoundError("db.toml not found"),
+            ),
+            patch("db_adapter.cli.read_profile_lock", return_value=None),
+            patch(
+                "db_adapter.cli.connect_and_validate",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ),
+            patch("db_adapter.cli.console") as mock_console,
+        ):
+            rc = asyncio.run(_async_connect(args))
+
+        assert rc == 0
+        printed = [str(call) for call in mock_console.print.call_args_list]
+        assert not any("PASSED" in s for s in printed), (
+            "'PASSED' should not appear when validation was skipped"
+        )
+
+    def test_connection_failure_returns_1(self):
+        """Connection failure (result.success is False) returns 1."""
+        mock_result = self._make_connection_result(
+            success=False,
+            error="Connection refused",
+            schema_report=None,
+        )
+
+        args = argparse.Namespace(env_prefix="")
+
+        with (
+            patch(
+                "db_adapter.cli.load_db_config",
+                side_effect=FileNotFoundError("no config"),
+            ),
+            patch("db_adapter.cli.read_profile_lock", return_value=None),
+            patch(
+                "db_adapter.cli.connect_and_validate",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ),
+        ):
+            rc = asyncio.run(_async_connect(args))
+
+        assert rc == 1
+
+    def test_schema_drift_returns_1_with_report(self):
+        """Schema drift (success=False with schema_report) returns 1 and
+        displays the schema report."""
+        mock_report = MagicMock()
+        mock_report.format_report.return_value = "Missing: users.email"
+
+        mock_result = self._make_connection_result(
+            success=False,
+            profile_name="dev",
+            schema_valid=False,
+            schema_report=mock_report,
+        )
+
+        args = argparse.Namespace(env_prefix="")
+
+        with (
+            patch(
+                "db_adapter.cli.load_db_config",
+                side_effect=FileNotFoundError("no config"),
+            ),
+            patch("db_adapter.cli.read_profile_lock", return_value=None),
+            patch(
+                "db_adapter.cli.connect_and_validate",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ),
+            patch("db_adapter.cli.console") as mock_console,
+        ):
+            rc = asyncio.run(_async_connect(args))
+
+        assert rc == 1
+        mock_report.format_report.assert_called_once()
+
+    def test_malformed_config_still_connects(self):
+        """Malformed db.toml (ValidationError from Pydantic) still connects
+        in connect-only mode."""
+        from pydantic import ValidationError
+
+        mock_result = self._make_connection_result(
+            success=True,
+            profile_name="dev",
+            schema_valid=None,
+        )
+
+        args = argparse.Namespace(env_prefix="")
+
+        with (
+            patch(
+                "db_adapter.cli.load_db_config",
+                side_effect=Exception("Validation error"),
+            ),
+            patch("db_adapter.cli.read_profile_lock", return_value=None),
+            patch(
+                "db_adapter.cli.connect_and_validate",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ) as mock_connect,
+        ):
+            rc = asyncio.run(_async_connect(args))
+
+        assert rc == 0
+        call_kwargs = mock_connect.call_args[1]
+        assert call_kwargs["expected_columns"] is None
+
+    def test_profile_switch_notice(self):
+        """Profile switch notice shows when previous profile differs."""
+        mock_result = self._make_connection_result(
+            success=True,
+            profile_name="production",
+            schema_valid=None,
+        )
+
+        args = argparse.Namespace(env_prefix="")
+
+        with (
+            patch(
+                "db_adapter.cli.load_db_config",
+                side_effect=FileNotFoundError("no config"),
+            ),
+            patch("db_adapter.cli.read_profile_lock", return_value="dev"),
+            patch(
+                "db_adapter.cli.connect_and_validate",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ),
+            patch("db_adapter.cli.console") as mock_console,
+        ):
+            rc = asyncio.run(_async_connect(args))
+
+        assert rc == 0
+        printed = [str(call) for call in mock_console.print.call_args_list]
+        assert any("Switched from" in s for s in printed)
+
+
+# ------------------------------------------------------------------
+# _async_validate config-driven validation
+# ------------------------------------------------------------------
+
+
+class TestAsyncValidateConfigDriven:
+    """Tests for config-driven schema validation in _async_validate()."""
+
+    def _make_connection_result(
+        self,
+        *,
+        success: bool = True,
+        profile_name: str = "dev",
+        schema_valid: bool | None = None,
+        schema_report: object | None = None,
+        error: str | None = None,
+    ) -> MagicMock:
+        """Create a mock ConnectionResult with the given fields."""
+        result = MagicMock()
+        result.success = success
+        result.profile_name = profile_name
+        result.schema_valid = schema_valid
+        result.schema_report = schema_report
+        result.error = error
+        return result
+
+    def test_validate_with_config_schema_file(self, tmp_path):
+        """validate with config schema file calls connect_and_validate
+        with expected_columns and validate_only=True."""
+        schema = tmp_path / "schema.sql"
+        schema.write_text(
+            "CREATE TABLE users (\n"
+            "    id TEXT PRIMARY KEY,\n"
+            "    email TEXT NOT NULL\n"
+            ");\n"
+        )
+
+        mock_config = MagicMock()
+        mock_config.schema_file = str(schema)
+
+        mock_result = self._make_connection_result(
+            success=True,
+            profile_name="dev",
+            schema_valid=True,
+        )
+
+        args = argparse.Namespace(env_prefix="", schema_file=None)
+
+        with (
+            patch("db_adapter.cli.load_db_config", return_value=mock_config),
+            patch("db_adapter.cli.read_profile_lock", return_value="dev"),
+            patch(
+                "db_adapter.cli.connect_and_validate",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ) as mock_connect,
+        ):
+            rc = asyncio.run(_async_validate(args))
+
+        assert rc == 0
+        call_kwargs = mock_connect.call_args[1]
+        assert "expected_columns" in call_kwargs
+        assert call_kwargs["expected_columns"] == {"users": {"id", "email"}}
+        assert call_kwargs["validate_only"] is True
+
+    def test_validate_schema_file_override(self, tmp_path):
+        """validate --schema-file override.sql uses the CLI-provided file
+        instead of config."""
+        override_schema = tmp_path / "override.sql"
+        override_schema.write_text(
+            "CREATE TABLE orders (\n"
+            "    id TEXT PRIMARY KEY,\n"
+            "    total NUMERIC NOT NULL\n"
+            ");\n"
+        )
+
+        mock_result = self._make_connection_result(
+            success=True,
+            profile_name="dev",
+            schema_valid=True,
+        )
+
+        args = argparse.Namespace(
+            env_prefix="", schema_file=str(override_schema)
+        )
+
+        with (
+            patch("db_adapter.cli.read_profile_lock", return_value="dev"),
+            patch(
+                "db_adapter.cli.connect_and_validate",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ) as mock_connect,
+            patch("db_adapter.cli.load_db_config") as mock_load_config,
+        ):
+            rc = asyncio.run(_async_validate(args))
+
+        assert rc == 0
+        # load_db_config should NOT be called when --schema-file is provided
+        mock_load_config.assert_not_called()
+        call_kwargs = mock_connect.call_args[1]
+        assert call_kwargs["expected_columns"] == {"orders": {"id", "total"}}
+        assert call_kwargs["validate_only"] is True
+
+    def test_validate_no_schema_source_returns_1(self):
+        """validate with no schema source (no --schema-file, no config)
+        returns 1 with informative error."""
+        args = argparse.Namespace(env_prefix="", schema_file=None)
+
+        with (
+            patch(
+                "db_adapter.cli.load_db_config",
+                side_effect=FileNotFoundError("db.toml not found"),
+            ),
+            patch("db_adapter.cli.read_profile_lock", return_value="dev"),
+            patch("db_adapter.cli.console") as mock_console,
+        ):
+            rc = asyncio.run(_async_validate(args))
+
+        assert rc == 1
+        printed = [str(call) for call in mock_console.print.call_args_list]
+        assert any("No schema file available" in s for s in printed)
+
+    def test_validate_config_schema_file_missing_returns_1(self, tmp_path):
+        """validate when config provides a schema file path that does not
+        exist returns 1 with error referencing the missing file."""
+        mock_config = MagicMock()
+        mock_config.schema_file = str(tmp_path / "nonexistent.sql")
+
+        args = argparse.Namespace(env_prefix="", schema_file=None)
+
+        with (
+            patch("db_adapter.cli.load_db_config", return_value=mock_config),
+            patch("db_adapter.cli.read_profile_lock", return_value="dev"),
+            patch("db_adapter.cli.console") as mock_console,
+        ):
+            rc = asyncio.run(_async_validate(args))
+
+        assert rc == 1
+        printed = [str(call) for call in mock_console.print.call_args_list]
+        assert any("nonexistent.sql" in s for s in printed)
+
+    def test_validate_no_profile_returns_1(self):
+        """validate with no validated profile returns 1."""
+        args = argparse.Namespace(env_prefix="", schema_file=None)
+
+        with patch("db_adapter.cli.read_profile_lock", return_value=None):
+            rc = asyncio.run(_async_validate(args))
+
+        assert rc == 1
+
+    def test_validate_connection_failure_returns_1(self, tmp_path):
+        """validate when connection fails returns 1 with error message."""
+        schema = tmp_path / "schema.sql"
+        schema.write_text(
+            "CREATE TABLE users (\n"
+            "    id TEXT PRIMARY KEY\n"
+            ");\n"
+        )
+
+        mock_config = MagicMock()
+        mock_config.schema_file = str(schema)
+
+        mock_result = self._make_connection_result(
+            success=False,
+            error="Connection refused",
+            schema_report=None,
+        )
+
+        args = argparse.Namespace(env_prefix="", schema_file=None)
+
+        with (
+            patch("db_adapter.cli.load_db_config", return_value=mock_config),
+            patch("db_adapter.cli.read_profile_lock", return_value="dev"),
+            patch(
+                "db_adapter.cli.connect_and_validate",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ),
+            patch("db_adapter.cli.console") as mock_console,
+        ):
+            rc = asyncio.run(_async_validate(args))
+
+        assert rc == 1
+        printed = [str(call) for call in mock_console.print.call_args_list]
+        assert any("Connection refused" in s for s in printed)
+
+    def test_validate_schema_drift_returns_1_with_report(self, tmp_path):
+        """validate when schema has drifted (success=False with schema_report)
+        returns 1 and displays the schema report."""
+        schema = tmp_path / "schema.sql"
+        schema.write_text(
+            "CREATE TABLE users (\n"
+            "    id TEXT PRIMARY KEY\n"
+            ");\n"
+        )
+
+        mock_config = MagicMock()
+        mock_config.schema_file = str(schema)
+
+        mock_report = MagicMock()
+        mock_report.format_report.return_value = "Missing: users.email"
+
+        mock_result = self._make_connection_result(
+            success=False,
+            profile_name="dev",
+            schema_valid=False,
+            schema_report=mock_report,
+        )
+
+        args = argparse.Namespace(env_prefix="", schema_file=None)
+
+        with (
+            patch("db_adapter.cli.load_db_config", return_value=mock_config),
+            patch("db_adapter.cli.read_profile_lock", return_value="dev"),
+            patch(
+                "db_adapter.cli.connect_and_validate",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ),
+        ):
+            rc = asyncio.run(_async_validate(args))
+
+        assert rc == 1
+        mock_report.format_report.assert_called_once()
+
+    def test_validate_schema_valid_false_returns_1(self, tmp_path):
+        """validate when result.success is True but schema_valid is False
+        returns 1 and shows drift report."""
+        schema = tmp_path / "schema.sql"
+        schema.write_text(
+            "CREATE TABLE users (\n"
+            "    id TEXT PRIMARY KEY\n"
+            ");\n"
+        )
+
+        mock_config = MagicMock()
+        mock_config.schema_file = str(schema)
+
+        mock_report = MagicMock()
+        mock_report.format_report.return_value = "Missing: users.email"
+
+        mock_result = self._make_connection_result(
+            success=True,
+            profile_name="dev",
+            schema_valid=False,
+            schema_report=mock_report,
+        )
+
+        args = argparse.Namespace(env_prefix="", schema_file=None)
+
+        with (
+            patch("db_adapter.cli.load_db_config", return_value=mock_config),
+            patch("db_adapter.cli.read_profile_lock", return_value="dev"),
+            patch(
+                "db_adapter.cli.connect_and_validate",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ),
+            patch("db_adapter.cli.console") as mock_console,
+        ):
+            rc = asyncio.run(_async_validate(args))
+
+        assert rc == 1
+        printed = [str(call) for call in mock_console.print.call_args_list]
+        assert any("drifted" in s for s in printed)
+
+    def test_validate_schema_valid_none_returns_1(self, tmp_path):
+        """validate when result.schema_valid is None (defensive case)
+        returns 1 with informational message."""
+        schema = tmp_path / "schema.sql"
+        schema.write_text(
+            "CREATE TABLE users (\n"
+            "    id TEXT PRIMARY KEY\n"
+            ");\n"
+        )
+
+        mock_config = MagicMock()
+        mock_config.schema_file = str(schema)
+
+        mock_result = self._make_connection_result(
+            success=True,
+            profile_name="dev",
+            schema_valid=None,
+        )
+
+        args = argparse.Namespace(env_prefix="", schema_file=None)
+
+        with (
+            patch("db_adapter.cli.load_db_config", return_value=mock_config),
+            patch("db_adapter.cli.read_profile_lock", return_value="dev"),
+            patch(
+                "db_adapter.cli.connect_and_validate",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ),
+            patch("db_adapter.cli.console") as mock_console,
+        ):
+            rc = asyncio.run(_async_validate(args))
+
+        assert rc == 1
+        printed = [str(call) for call in mock_console.print.call_args_list]
+        assert any("could not be performed" in s for s in printed)
+
+    def test_validate_config_with_none_schema_file(self):
+        """validate when config loads but schema_file is None (not configured)
+        returns 1 with 'No schema file available' error."""
+        mock_config = MagicMock()
+        mock_config.schema_file = None
+
+        args = argparse.Namespace(env_prefix="", schema_file=None)
+
+        with (
+            patch("db_adapter.cli.load_db_config", return_value=mock_config),
+            patch("db_adapter.cli.read_profile_lock", return_value="dev"),
+            patch("db_adapter.cli.console") as mock_console,
+        ):
+            rc = asyncio.run(_async_validate(args))
+
+        assert rc == 1
+        printed = [str(call) for call in mock_console.print.call_args_list]
+        assert any("No schema file available" in s for s in printed)
+
+
+# ------------------------------------------------------------------
+# _async_sync .errors attribute fix
+# ------------------------------------------------------------------
+
+
+class TestAsyncSyncErrors:
+    """Tests for _async_sync() using .errors list instead of .error string."""
+
+    def test_sync_compare_failure_uses_errors_list(self):
+        """_async_sync() accesses result.errors (list) not result.error
+        when compare_profiles returns a failure."""
+        mock_result = MagicMock()
+        mock_result.success = False
+        mock_result.errors = ["Connection to source failed", "Timeout"]
+
+        args = argparse.Namespace(
+            env_prefix="",
+            source="rds",
+            tables="users,orders",
+            user_id="abc",
+            dry_run=False,
+            confirm=True,
+        )
+
+        with (
+            patch("db_adapter.cli.read_profile_lock", return_value="dev"),
+            patch(
+                "db_adapter.cli.compare_profiles",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ),
+            patch("db_adapter.cli.console") as mock_console,
+        ):
+            rc = asyncio.run(_async_sync(args))
+
+        assert rc == 1
+        printed = [str(call) for call in mock_console.print.call_args_list]
+        # Should show all errors joined with "; "
+        assert any("Connection to source failed; Timeout" in s for s in printed)
+
+    def test_sync_data_failure_uses_errors_list(self):
+        """_async_sync() accesses sync_result.errors (list) not .error
+        when sync_data returns a failure."""
+        # compare_profiles succeeds
+        compare_result = MagicMock()
+        compare_result.success = True
+        compare_result.source_counts = {"users": 10}
+        compare_result.dest_counts = {"users": 5}
+        compare_result.sync_plan = {"users": {"new": 5, "update": 0}}
+
+        # sync_data fails
+        sync_result = MagicMock()
+        sync_result.success = False
+        sync_result.errors = ["Insert failed on users.id=3", "FK constraint"]
+
+        args = argparse.Namespace(
+            env_prefix="",
+            source="rds",
+            tables="users",
+            user_id="abc",
+            dry_run=False,
+            confirm=True,
+        )
+
+        with (
+            patch("db_adapter.cli.read_profile_lock", return_value="dev"),
+            patch(
+                "db_adapter.cli.compare_profiles",
+                new_callable=AsyncMock,
+                return_value=compare_result,
+            ),
+            patch(
+                "db_adapter.cli.sync_data",
+                new_callable=AsyncMock,
+                return_value=sync_result,
+            ),
+            patch("db_adapter.cli.console") as mock_console,
+        ):
+            rc = asyncio.run(_async_sync(args))
+
+        assert rc == 1
+        printed = [str(call) for call in mock_console.print.call_args_list]
+        assert any(
+            "Insert failed on users.id=3; FK constraint" in s for s in printed
+        )
+
+    def test_sync_compare_failure_empty_errors_shows_unknown(self):
+        """_async_sync() shows 'Unknown error' when errors list is empty."""
+        mock_result = MagicMock()
+        mock_result.success = False
+        mock_result.errors = []
+
+        args = argparse.Namespace(
+            env_prefix="",
+            source="rds",
+            tables="users",
+            user_id="abc",
+            dry_run=False,
+            confirm=True,
+        )
+
+        with (
+            patch("db_adapter.cli.read_profile_lock", return_value="dev"),
+            patch(
+                "db_adapter.cli.compare_profiles",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ),
+            patch("db_adapter.cli.console") as mock_console,
+        ):
+            rc = asyncio.run(_async_sync(args))
+
+        assert rc == 1
+        printed = [str(call) for call in mock_console.print.call_args_list]
+        assert any("Unknown error" in s for s in printed)
+
+    def test_sync_source_code_has_no_dot_error(self):
+        """_async_sync() source code has no reference to .error attribute
+        (only .errors list)."""
+        import inspect
+
+        source = inspect.getsource(_async_sync)
+        # Should not find .error (but .errors is OK)
+        # Use a regex to match .error NOT followed by 's'
+        import re
+
+        matches = re.findall(r"\.error\b(?!s)", source)
+        assert len(matches) == 0, (
+            f"Found {len(matches)} reference(s) to .error in _async_sync() "
+            f"(should be .errors)"
+        )
+
+
+# ------------------------------------------------------------------
+# _async_fix config fallback for --schema-file
+# ------------------------------------------------------------------
+
+
+class TestAsyncFixConfigFallback:
+    """Tests for _async_fix() config fallback when --schema-file is omitted."""
+
+    def test_fix_uses_config_schema_file_when_flag_omitted(self, tmp_path):
+        """fix without --schema-file falls back to config.schema_file."""
+        schema = tmp_path / "schema.sql"
+        schema.write_text(
+            "CREATE TABLE users (\n"
+            "    id TEXT PRIMARY KEY,\n"
+            "    email TEXT NOT NULL\n"
+            ");\n"
+        )
+        col_defs = tmp_path / "defs.json"
+        col_defs.write_text('{"users.email": "TEXT NOT NULL"}')
+
+        mock_config = MagicMock()
+        mock_config.schema_file = str(schema)
+
+        mock_result = MagicMock()
+        mock_result.schema_valid = True
+
+        args = argparse.Namespace(
+            env_prefix="",
+            schema_file=None,
+            column_defs=str(col_defs),
+            confirm=False,
+        )
+
+        with (
+            patch(
+                "db_adapter.cli.get_active_profile_name",
+                return_value="dev",
+            ),
+            patch("db_adapter.cli.load_db_config", return_value=mock_config),
+            patch(
+                "db_adapter.cli.connect_and_validate",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ) as mock_connect,
+        ):
+            rc = asyncio.run(_async_fix(args))
+
+        assert rc == 0
+        # Verify expected_columns was derived from config schema file
+        call_kwargs = mock_connect.call_args[1]
+        assert call_kwargs["expected_columns"] == {"users": {"id", "email"}}
+
+    def test_fix_uses_explicit_schema_file_over_config(self, tmp_path):
+        """fix --schema-file explicit.sql uses the provided file,
+        not config."""
+        schema = tmp_path / "explicit.sql"
+        schema.write_text(
+            "CREATE TABLE orders (\n"
+            "    id TEXT PRIMARY KEY,\n"
+            "    total NUMERIC NOT NULL\n"
+            ");\n"
+        )
+        col_defs = tmp_path / "defs.json"
+        col_defs.write_text('{"orders.total": "NUMERIC NOT NULL"}')
+
+        mock_result = MagicMock()
+        mock_result.schema_valid = True
+
+        args = argparse.Namespace(
+            env_prefix="",
+            schema_file=str(schema),
+            column_defs=str(col_defs),
+            confirm=False,
+        )
+
+        with (
+            patch(
+                "db_adapter.cli.get_active_profile_name",
+                return_value="dev",
+            ),
+            patch(
+                "db_adapter.cli.connect_and_validate",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ) as mock_connect,
+            patch("db_adapter.cli.load_db_config") as mock_load_config,
+        ):
+            rc = asyncio.run(_async_fix(args))
+
+        assert rc == 0
+        # load_db_config should NOT be called when --schema-file is provided
+        mock_load_config.assert_not_called()
+        call_kwargs = mock_connect.call_args[1]
+        assert call_kwargs["expected_columns"] == {"orders": {"id", "total"}}
+
+    def test_fix_no_schema_source_returns_1(self):
+        """fix with no --schema-file and no config returns 1 with error."""
+        args = argparse.Namespace(
+            env_prefix="",
+            schema_file=None,
+            column_defs="defs.json",
+            confirm=False,
+        )
+
+        with (
+            patch(
+                "db_adapter.cli.get_active_profile_name",
+                return_value="dev",
+            ),
+            patch(
+                "db_adapter.cli.load_db_config",
+                side_effect=FileNotFoundError("db.toml not found"),
+            ),
+            patch("db_adapter.cli.console") as mock_console,
+        ):
+            rc = asyncio.run(_async_fix(args))
+
+        assert rc == 1
+        printed = [str(call) for call in mock_console.print.call_args_list]
+        assert any("No schema file available" in s for s in printed)
+
+    def test_fix_config_with_none_schema_file_returns_1(self):
+        """fix when config loads but schema_file is None returns 1."""
+        mock_config = MagicMock()
+        mock_config.schema_file = None
+
+        args = argparse.Namespace(
+            env_prefix="",
+            schema_file=None,
+            column_defs="defs.json",
+            confirm=False,
+        )
+
+        with (
+            patch(
+                "db_adapter.cli.get_active_profile_name",
+                return_value="dev",
+            ),
+            patch("db_adapter.cli.load_db_config", return_value=mock_config),
+            patch("db_adapter.cli.console") as mock_console,
+        ):
+            rc = asyncio.run(_async_fix(args))
+
+        assert rc == 1
+        printed = [str(call) for call in mock_console.print.call_args_list]
+        assert any("No schema file available" in s for s in printed)
 
 
 # ------------------------------------------------------------------

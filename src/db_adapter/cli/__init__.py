@@ -102,10 +102,10 @@ def _parse_expected_columns(schema_file: str | Path) -> dict[str, set[str]]:
             # Skip if it looks like a SQL keyword (all-caps, known keywords)
             if col_name.upper() in ("CREATE", "TABLE", "IF", "NOT", "EXISTS"):
                 continue
-            columns.add(col_name)
+            columns.add(col_name.lower())
 
         if columns:
-            result[table_name] = columns
+            result[table_name.lower()] = columns
 
     if not result:
         raise ValueError(
@@ -123,6 +123,12 @@ def _parse_expected_columns(schema_file: str | Path) -> dict[str, set[str]]:
 async def _async_connect(args: argparse.Namespace) -> int:
     """Async implementation for connect command.
 
+    Loads config from ``db.toml`` to determine whether schema validation
+    should be performed.  When ``validate_on_connect`` is ``True`` and a
+    schema file is available, expected columns are parsed and passed to
+    ``connect_and_validate()``.  Gracefully degrades to connect-only mode
+    when config or schema file is unavailable.
+
     Args:
         args: Parsed arguments with env_prefix.
 
@@ -135,50 +141,91 @@ async def _async_connect(args: argparse.Namespace) -> int:
 
     console.print("Connecting to database...", style="dim")
 
-    result = await connect_and_validate(env_prefix=env_prefix)
+    # Determine expected_columns based on config
+    expected_columns: dict[str, set[str]] | None = None
+    validation_skip_reason: str | None = None
 
-    if result.success:
+    try:
+        config = load_db_config()
+    except Exception:
+        # db.toml missing or malformed -- fall back to connect-only
+        config = None
+        validation_skip_reason = "no config found"
+
+    if config is not None:
+        if config.validate_on_connect is True:
+            try:
+                expected_columns = _parse_expected_columns(config.schema_file)
+            except (FileNotFoundError, ValueError):
+                # Schema file missing or unparseable -- connect-only
+                validation_skip_reason = "schema file not found"
+        else:
+            validation_skip_reason = "schema validation disabled in config"
+
+    result = await connect_and_validate(
+        env_prefix=env_prefix,
+        expected_columns=expected_columns,
+    )
+
+    if not result.success:
         console.print()
-        console.print(
-            f"[bold green]v[/bold green] Connected to profile: "
-            f"[bold cyan]{result.profile_name}[/bold cyan]"
-        )
+        if result.schema_report:
+            console.print(
+                f"[bold red]x[/bold red] Connected to profile: "
+                f"[bold cyan]{result.profile_name}[/bold cyan]"
+            )
+            console.print("\n[bold]Schema validation report:[/bold]")
+            console.print(result.schema_report.format_report())
+        else:
+            console.print(f"[bold red]x[/bold red] {result.error}")
+        return 1
+
+    # Success path
+    console.print()
+    console.print(
+        f"[bold green]v[/bold green] Connected to profile: "
+        f"[bold cyan]{result.profile_name}[/bold cyan]"
+    )
+
+    if result.schema_valid is True:
         console.print("  Schema validation: [green]PASSED[/green]")
         if result.schema_report and result.schema_report.extra_tables:
             console.print(
                 f"  Extra tables: [yellow]"
                 f"{', '.join(result.schema_report.extra_tables)}[/yellow]"
             )
+    elif result.schema_valid is None:
+        console.print(
+            f"  Connected ({validation_skip_reason} "
+            f"-- schema validation skipped)"
+        )
 
-        # Show profile switch notice
-        if previous_profile and previous_profile != result.profile_name:
-            console.print(
-                f"\n[dim]Switched from[/dim] [bold]{previous_profile}[/bold] "
-                f"[dim]to[/dim] [bold cyan]{result.profile_name}[/bold cyan]"
-            )
+    # Show profile switch notice
+    if previous_profile and previous_profile != result.profile_name:
+        console.print(
+            f"\n[dim]Switched from[/dim] [bold]{previous_profile}[/bold] "
+            f"[dim]to[/dim] [bold cyan]{result.profile_name}[/bold cyan]"
+        )
 
-        return 0
-    else:
-        console.print()
-        console.print(f"[bold red]x[/bold red] {result.error}")
-
-        if result.schema_report:
-            console.print("\n[bold]Schema validation report:[/bold]")
-            console.print(result.schema_report.format_report())
-
-        return 1
+    return 0
 
 
 async def _async_validate(args: argparse.Namespace) -> int:
     """Async implementation for validate command.
 
+    Loads expected columns from config (``schema_file`` field) or from
+    the ``--schema-file`` CLI override.  Passes them to
+    ``connect_and_validate()`` with ``validate_only=True`` so the
+    ``.db-profile`` lock file is not overwritten.
+
     Args:
-        args: Parsed arguments with env_prefix.
+        args: Parsed arguments with env_prefix and optional schema_file.
 
     Returns:
         0 on valid schema, 1 on invalid or no profile.
     """
     env_prefix = getattr(args, "env_prefix", "")
+    cli_schema_file: str | None = getattr(args, "schema_file", None)
 
     profile = read_profile_lock()
 
@@ -193,11 +240,66 @@ async def _async_validate(args: argparse.Namespace) -> int:
         f"Validating schema for profile: [bold cyan]{profile}[/bold cyan]"
     )
 
+    # Determine schema file source: CLI override takes precedence over config
+    schema_file_path: str | None = None
+
+    if cli_schema_file is not None:
+        # CLI --schema-file provided: skip config loading
+        schema_file_path = cli_schema_file
+    else:
+        # Attempt to load schema file from config
+        try:
+            config = load_db_config()
+            schema_file_path = config.schema_file
+        except Exception:
+            # db.toml missing or malformed -- no schema source
+            pass
+
+    # If no schema source available, report and exit
+    if schema_file_path is None:
+        console.print(
+            "\n[red]Error: No schema file available. "
+            "Provide --schema-file or configure schema.file in db.toml[/red]"
+        )
+        return 1
+
+    # Parse expected columns from the resolved schema file
+    try:
+        expected_columns = _parse_expected_columns(schema_file_path)
+    except FileNotFoundError:
+        console.print(
+            f"\n[red]Error: Schema file not found: {schema_file_path}[/red]"
+        )
+        return 1
+    except ValueError as e:
+        console.print(f"\n[red]Error: {e}[/red]")
+        return 1
+
+    # Validate with expected_columns; validate_only=True prevents
+    # overwriting the .db-profile lock file
     result = await connect_and_validate(
-        profile_name=profile, env_prefix=env_prefix
+        profile_name=profile,
+        expected_columns=expected_columns,
+        env_prefix=env_prefix,
+        validate_only=True,
     )
 
-    if result.schema_valid:
+    # Check connection success first
+    if not result.success:
+        console.print()
+        if result.schema_report:
+            console.print(
+                f"[bold red]x[/bold red] Connected to profile: "
+                f"[bold cyan]{profile}[/bold cyan]"
+            )
+            console.print("\n[bold]Schema validation report:[/bold]")
+            console.print(result.schema_report.format_report())
+        else:
+            console.print(f"[bold red]x[/bold red] {result.error}")
+        return 1
+
+    # Three-state schema_valid check
+    if result.schema_valid is True:
         console.print()
         console.print("[bold green]v[/bold green] Schema is valid")
         if result.schema_report and result.schema_report.extra_tables:
@@ -206,24 +308,34 @@ async def _async_validate(args: argparse.Namespace) -> int:
                 f"{', '.join(result.schema_report.extra_tables)}[/yellow]"
             )
         return 0
-    else:
+    elif result.schema_valid is False:
         console.print()
         console.print("[bold red]x[/bold red] Schema has drifted")
         if result.schema_report:
             console.print(result.schema_report.format_report())
+        return 1
+    elif result.schema_valid is None:
+        # Defensive handler: should not occur when expected_columns is
+        # always passed, but handle gracefully
+        console.print()
+        console.print(
+            "[yellow]Validation could not be performed[/yellow]"
+        )
         return 1
 
 
 async def _async_fix(args: argparse.Namespace) -> int:
     """Async implementation for fix command.
 
-    Uses ``--schema-file`` to parse expected columns and CREATE TABLE SQL,
-    and ``--column-defs`` for ALTER TABLE column type definitions.
+    Resolves the schema file from ``--schema-file`` CLI argument or falls
+    back to ``config.schema_file`` from ``db.toml``.  Uses the resolved
+    schema file to parse expected columns and CREATE TABLE SQL, and
+    ``--column-defs`` for ALTER TABLE column type definitions.
     Delegates FK ordering to ``FixPlan.drop_order``/``create_order``.
 
     Args:
-        args: Parsed arguments with schema_file, column_defs, confirm,
-            no_backup, and env_prefix.
+        args: Parsed arguments with optional schema_file, column_defs,
+            confirm, and env_prefix.
 
     Returns:
         0 on success, 1 on failure.
@@ -247,9 +359,27 @@ async def _async_fix(args: argparse.Namespace) -> int:
         f"Analyzing schema for profile: [bold cyan]{profile}[/bold cyan]"
     )
 
+    # Resolve schema file: CLI --schema-file takes precedence over config
+    schema_file: str | None = getattr(args, "schema_file", None)
+
+    if schema_file is None:
+        try:
+            config = load_db_config()
+            schema_file = config.schema_file
+        except Exception:
+            # db.toml missing or malformed -- no schema source
+            pass
+
+    if schema_file is None:
+        console.print(
+            "\n[red]Error: No schema file available. "
+            "Provide --schema-file or configure schema.file in db.toml[/red]"
+        )
+        return 1
+
     # Parse expected columns from schema file
     try:
-        expected_columns = _parse_expected_columns(args.schema_file)
+        expected_columns = _parse_expected_columns(schema_file)
     except (FileNotFoundError, ValueError) as e:
         console.print(f"\n[red]Error: {e}[/red]")
         return 1
@@ -285,7 +415,7 @@ async def _async_fix(args: argparse.Namespace) -> int:
 
     # Generate fix plan using the new signature
     plan = generate_fix_plan(
-        result.schema_report, column_definitions, args.schema_file
+        result.schema_report, column_definitions, schema_file
     )
 
     if plan.error:
@@ -334,10 +464,6 @@ async def _async_fix(args: argparse.Namespace) -> int:
     console.print()
     console.print("[bold]Execution Plan:[/bold]")
     step = 1
-
-    if not args.no_backup:
-        console.print(f"  {step}. Backup [cyan]{profile}[/cyan] database")
-        step += 1
 
     if plan.missing_tables:
         for t_name in plan.create_order:
@@ -496,7 +622,8 @@ async def _async_sync(args: argparse.Namespace) -> int:
     )
 
     if not result.success:
-        console.print(f"\n[red]Error: {result.error}[/red]")
+        error_msg = "; ".join(result.errors) if result.errors else "Unknown error"
+        console.print(f"\n[red]Error: {error_msg}[/red]")
         return 1
 
     # Show comparison table
@@ -566,7 +693,12 @@ async def _async_sync(args: argparse.Namespace) -> int:
         console.print("[bold green]v[/bold green] Sync complete.")
         return 0
     else:
-        console.print(f"[bold red]x[/bold red] {sync_result.error}")
+        error_msg = (
+            "; ".join(sync_result.errors)
+            if sync_result.errors
+            else "Unknown error"
+        )
+        console.print(f"[bold red]x[/bold red] {error_msg}")
         return 1
 
 
@@ -775,6 +907,15 @@ def main() -> int:
         "validate",
         help="Re-validate current profile schema",
     )
+    p_validate.add_argument(
+        "--schema-file",
+        required=False,
+        default=None,
+        help=(
+            "Path to SQL file containing CREATE TABLE statements "
+            "(overrides schema.file in db.toml)"
+        ),
+    )
     p_validate.set_defaults(func=cmd_validate)
 
     # sync command
@@ -818,8 +959,12 @@ def main() -> int:
     )
     p_fix.add_argument(
         "--schema-file",
-        required=True,
-        help="Path to SQL file containing CREATE TABLE statements",
+        required=False,
+        default=None,
+        help=(
+            "Path to SQL file containing CREATE TABLE statements "
+            "(defaults to schema.file in db.toml)"
+        ),
     )
     p_fix.add_argument(
         "--column-defs",
@@ -830,11 +975,6 @@ def main() -> int:
         "--confirm",
         action="store_true",
         help="Apply fixes",
-    )
-    p_fix.add_argument(
-        "--no-backup",
-        action="store_true",
-        help="Skip backup step (for testing only)",
     )
     p_fix.set_defaults(func=cmd_fix)
 

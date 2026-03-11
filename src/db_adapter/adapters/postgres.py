@@ -49,17 +49,19 @@ def create_async_engine_pooled(database_url: str, **kwargs: Any) -> AsyncEngine:
             "postgresql+asyncpg://user:pass@localhost/mydb"
         )
     """
-    # Append connect_timeout if not already in URL
-    if "connect_timeout" not in database_url:
-        separator = "&" if "?" in database_url else "?"
-        database_url = f"{database_url}{separator}connect_timeout=5"
-
+    # Connection timeout is passed via connect_args (asyncpg's native "timeout"
+    # parameter) rather than as a URL query parameter.  asyncpg does not
+    # recognize "connect_timeout" in the DSN and raises an error.
+    # Note: connect_args is overridable by caller kwargs via {**defaults,
+    # **kwargs} -- override is full replacement (not merge), consistent with
+    # how all other default keys behave.
     defaults: dict[str, Any] = {
         "pool_size": 5,
         "max_overflow": 10,
         "pool_pre_ping": True,
         "pool_recycle": 300,
         "echo": False,
+        "connect_args": {"timeout": 5},
     }
     # Caller kwargs override defaults
     merged = {**defaults, **kwargs}

@@ -76,6 +76,10 @@ url = "postgresql://user:[YOUR-PASSWORD]@rds-host:5432/mydb"
 description = "AWS RDS production"
 db_password = "secret"
 provider = "postgres"
+
+[schema]
+file = "schema.sql"              # Path to SQL file with CREATE TABLE statements
+validate_on_connect = true       # Validate schema on `db-adapter connect`
 ```
 
 Use the factory to create adapters:
@@ -251,7 +255,7 @@ db-adapter/
 │   └── cli/
 │       ├── __init__.py       # Main CLI (connect, status, profiles, validate, fix, sync)
 │       └── backup.py         # Standalone backup CLI
-└── tests/                    # 553 tests
+└── tests/                    # 704 tests
 ```
 
 ### Key design decisions
@@ -267,12 +271,14 @@ db-adapter/
 ## CLI Reference
 
 ```bash
-db-adapter connect                                                    # Connect + validate schema
+db-adapter connect                                                    # Connect + validate schema (uses schema.file and validate_on_connect from db.toml)
 db-adapter status                                                     # Show current profile
 db-adapter profiles                                                   # List available profiles
-db-adapter validate                                                   # Re-validate current profile
-db-adapter fix --schema-file schema.sql --column-defs defs.json       # Preview schema fix (dry run)
-db-adapter fix --schema-file schema.sql --column-defs defs.json --confirm  # Apply schema fix
+db-adapter validate                                                   # Re-validate current profile (uses schema.file from db.toml)
+db-adapter validate --schema-file schema.sql                          # Re-validate with explicit schema file
+db-adapter fix --column-defs defs.json                                # Preview schema fix (uses schema.file from db.toml)
+db-adapter fix --schema-file schema.sql --column-defs defs.json       # Preview schema fix with explicit schema file
+db-adapter fix --column-defs defs.json --confirm                      # Apply schema fix
 db-adapter sync --from rds --tables users,orders --user-id abc --dry-run   # Preview sync
 db-adapter sync --from rds --tables users,orders --user-id abc --confirm   # Execute sync
 db-adapter --env-prefix MC_ connect                                   # Use MC_DB_PROFILE env var
@@ -289,7 +295,7 @@ uv sync --extra dev
 # Install with Supabase support
 uv sync --extra supabase
 
-# Run all tests (553 tests)
+# Run all tests (704 tests)
 uv run pytest
 
 # Run a single test file

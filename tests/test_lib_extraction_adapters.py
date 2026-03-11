@@ -533,12 +533,30 @@ class TestCreateAsyncEnginePooled:
             _, kwargs = mock_create.call_args
             assert kwargs["pool_size"] == 20
 
-    def test_appends_connect_timeout(self) -> None:
-        """Appends connect_timeout=5 when not already in URL."""
+    def test_passes_connect_args_timeout(self) -> None:
+        """Passes connect_args={"timeout": 5} to create_async_engine (not URL param)."""
         from db_adapter.adapters.postgres import create_async_engine_pooled
 
         with patch("db_adapter.adapters.postgres.create_async_engine") as mock_create:
             mock_create.return_value = MagicMock()
             create_async_engine_pooled("postgresql+asyncpg://user:pass@host/db")
+            # connect_args with asyncpg-native timeout must be in kwargs
+            call_kwargs = mock_create.call_args[1]
+            assert call_kwargs.get("connect_args") == {"timeout": 5}
+            # connect_timeout must NOT appear in the URL
             call_url = mock_create.call_args[0][0]
-            assert "connect_timeout=5" in call_url
+            assert "connect_timeout" not in call_url
+
+    def test_caller_can_override_connect_args(self) -> None:
+        """Caller kwargs override connect_args default (full replacement)."""
+        from db_adapter.adapters.postgres import create_async_engine_pooled
+
+        with patch("db_adapter.adapters.postgres.create_async_engine") as mock_create:
+            mock_create.return_value = MagicMock()
+            create_async_engine_pooled(
+                "postgresql+asyncpg://user:pass@host/db",
+                connect_args={"command_timeout": 10},
+            )
+            call_kwargs = mock_create.call_args[1]
+            # Caller's connect_args replaces the default entirely
+            assert call_kwargs.get("connect_args") == {"command_timeout": 10}

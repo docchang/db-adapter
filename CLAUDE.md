@@ -20,7 +20,7 @@ uv sync --extra supabase
 # Install with dev dependencies
 uv sync --extra dev
 
-# Run all tests (553 tests)
+# Run all tests (704 tests)
 uv run pytest
 
 # Run a single test file
@@ -50,6 +50,7 @@ uv run db-adapter <command>
 | `test_lib_extraction_introspector.py` | SchemaIntrospector async context manager |
 | `test_lib_extraction_models.py` | Pydantic model validation |
 | `test_lib_extraction_sync.py` | `compare_profiles()`, `sync_data()` |
+| `test_live_integration.py` | End-to-end tests against real PostgreSQL databases (requires `full` and `drift` profiles) |
 
 pytest config: `asyncio_mode = "auto"` in pyproject.toml.
 
@@ -84,12 +85,14 @@ All code uses **absolute package imports**: `from db_adapter.adapters.base impor
 ### CLI Commands
 
 ```bash
-db-adapter connect                                                    # Connect + validate schema
+db-adapter connect                                                    # Connect + validate schema (reads schema.file and validate_on_connect from db.toml)
 db-adapter status                                                     # Show current profile (local files only)
 db-adapter profiles                                                   # List profiles from db.toml
-db-adapter validate                                                   # Re-validate current profile schema
-db-adapter fix --schema-file schema.sql --column-defs defs.json       # Preview schema fix (dry run)
-db-adapter fix --schema-file schema.sql --column-defs defs.json --confirm  # Apply schema fix
+db-adapter validate                                                   # Re-validate current profile (uses schema.file from db.toml)
+db-adapter validate --schema-file schema.sql                          # Re-validate with explicit schema file (overrides config)
+db-adapter fix --column-defs defs.json                                # Preview schema fix (--schema-file defaults to schema.file in db.toml)
+db-adapter fix --schema-file schema.sql --column-defs defs.json       # Preview schema fix with explicit schema file
+db-adapter fix --column-defs defs.json --confirm                      # Apply schema fix
 db-adapter sync --from rds --tables users,orders --user-id abc --dry-run   # Preview sync
 db-adapter sync --from rds --tables users,orders --user-id abc --confirm   # Execute sync
 db-adapter --env-prefix MC_ connect                                   # Use MC_DB_PROFILE env var

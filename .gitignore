@@ -11,5 +11,6 @@ build/
 db.toml
 *.lock
 !uv.lock
+.coverage
 .pytest_cache/
 .mypy_cache/

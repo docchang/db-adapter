@@ -5,7 +5,8 @@ __all__ lists are defined and accurate, and that top-level convenience
 imports work correctly.
 """
 
-import importlib
+import subprocess
+import sys
 import types
 
 
@@ -23,7 +24,7 @@ class TestTopLevelExports:
 
         assert hasattr(db_adapter, "__version__")
         assert isinstance(db_adapter.__version__, str)
-        assert db_adapter.__version__ == "0.1.0"
+        assert db_adapter.__version__ == "0.1.1"
 
     def test_all_defined(self) -> None:
         """Package __all__ is defined and is a list."""
@@ -477,18 +478,30 @@ class TestNoCircularImports:
 
     def test_import_order_schema_then_backup(self) -> None:
         """Importing schema then backup does not error."""
-        importlib.reload(importlib.import_module("db_adapter.schema"))
-        importlib.reload(importlib.import_module("db_adapter.backup"))
+        result = subprocess.run(
+            [sys.executable, "-c", "import db_adapter.schema; import db_adapter.backup"],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"Import failed: {result.stderr}"
 
     def test_import_order_backup_then_schema(self) -> None:
         """Importing backup then schema does not error."""
-        importlib.reload(importlib.import_module("db_adapter.backup"))
-        importlib.reload(importlib.import_module("db_adapter.schema"))
+        result = subprocess.run(
+            [sys.executable, "-c", "import db_adapter.backup; import db_adapter.schema"],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"Import failed: {result.stderr}"
 
     def test_import_order_config_then_factory(self) -> None:
         """Importing config then factory does not error."""
-        importlib.reload(importlib.import_module("db_adapter.config"))
-        importlib.reload(importlib.import_module("db_adapter.factory"))
+        result = subprocess.run(
+            [sys.executable, "-c", "import db_adapter.config; import db_adapter.factory"],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"Import failed: {result.stderr}"
 
     def test_import_all_subpackages(self) -> None:
         """All subpackages can be imported together."""
