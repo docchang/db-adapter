@@ -349,7 +349,7 @@ cd /Users/docchang/Development/db-adapter && uv run pytest tests/test_lib_extrac
 
 ### ~~Step 6~~: Moved
 
-> Backup CLI (Design Bug #6) moved to separate task: [core-backup-cli-design.md](core-backup-cli-design.md)
+> Backup CLI (Design Bug #6) moved to separate task: [core-cli-unify-design.md](core-cli-unify-design.md)
 
 ---
 

@@ -16,13 +16,15 @@ Usage:
     await adapter.close()
 """
 
+import contextvars
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 
 def create_async_engine_pooled(database_url: str, **kwargs: Any) -> AsyncEngine:
@@ -114,6 +116,47 @@ class AsyncPostgresAdapter:
 
         self._jsonb_columns: frozenset[str] = frozenset(jsonb_columns or [])
         self._engine: AsyncEngine = create_async_engine_pooled(url, **engine_kwargs)
+        self._transaction_conn: contextvars.ContextVar[AsyncConnection | None] = contextvars.ContextVar(
+            f"_transaction_conn_{id(self)}", default=None
+        )
+
+    # ------------------------------------------------------------------
+    # Transaction Support
+    # ------------------------------------------------------------------
+
+    @asynccontextmanager
+    async def transaction(self):
+        """Enter a transaction. Auto-commits on clean exit, auto-rolls back on exception.
+
+        Uses ``engine.begin()`` to acquire an ``AsyncConnection`` and stores
+        it in a per-instance ``ContextVar``.  All CRUD methods check the
+        ContextVar before creating their own connection, so operations
+        within the ``async with`` block share a single transactional
+        connection.
+
+        Yields:
+            None -- the transaction connection is accessed implicitly via
+            the ContextVar inside each CRUD method.
+
+        Raises:
+            RuntimeError: If called while already inside a transaction
+                (nested transactions are not supported).
+
+        Example:
+            async with adapter.transaction():
+                await adapter.insert("users", {"name": "Alice"})
+                await adapter.delete("temp", {"status": "expired"})
+                # Both committed atomically on clean exit
+        """
+        if self._transaction_conn.get(None) is not None:
+            raise RuntimeError("Nested transactions are not supported")
+
+        async with self._engine.begin() as conn:
+            token = self._transaction_conn.set(conn)
+            try:
+                yield
+            finally:
+                self._transaction_conn.reset(token)
 
     # ------------------------------------------------------------------
     # CRUD Methods
@@ -143,6 +186,13 @@ class AsyncPostgresAdapter:
         order_clause = f" ORDER BY {order_by}" if order_by else ""
 
         query = text(f"SELECT {columns} FROM {table}{where_clause}{order_clause}")
+
+        txn_conn = self._transaction_conn.get(None)
+        if txn_conn is not None:
+            result = await txn_conn.execute(query, params)
+            col_names = list(result.keys())
+            rows = result.fetchall()
+            return [self._serialize_row(dict(zip(col_names, row))) for row in rows]
 
         async with self._engine.connect() as conn:
             result = await conn.execute(query, params)
@@ -185,6 +235,13 @@ class AsyncPostgresAdapter:
                 params[col] = json.dumps(val)
             else:
                 params[col] = val
+
+        txn_conn = self._transaction_conn.get(None)
+        if txn_conn is not None:
+            result = await txn_conn.execute(query, params)
+            row = result.fetchone()
+            col_names = list(result.keys())
+            return self._serialize_row(dict(zip(col_names, row)))
 
         async with self._engine.begin() as conn:
             result = await conn.execute(query, params)
@@ -235,6 +292,15 @@ class AsyncPostgresAdapter:
             RETURNING *
         """)
 
+        txn_conn = self._transaction_conn.get(None)
+        if txn_conn is not None:
+            result = await txn_conn.execute(query, params)
+            row = result.fetchone()
+            if row is None:
+                raise ValueError(f"No rows matched filters: {filters}")
+            col_names = list(result.keys())
+            return self._serialize_row(dict(zip(col_names, row)))
+
         async with self._engine.begin() as conn:
             result = await conn.execute(query, params)
             row = result.fetchone()
@@ -260,6 +326,11 @@ class AsyncPostgresAdapter:
         where_clause = " AND ".join(where_parts)
         query = text(f"DELETE FROM {table} WHERE {where_clause}")
 
+        txn_conn = self._transaction_conn.get(None)
+        if txn_conn is not None:
+            await txn_conn.execute(query, params)
+            return
+
         async with self._engine.begin() as conn:
             await conn.execute(query, params)
 
@@ -282,6 +353,11 @@ class AsyncPostgresAdapter:
                 "CREATE TABLE items (id SERIAL PRIMARY KEY, name TEXT)"
             )
         """
+        txn_conn = self._transaction_conn.get(None)
+        if txn_conn is not None:
+            await txn_conn.execute(text(sql), params or {})
+            return
+
         async with self._engine.begin() as conn:
             await conn.execute(text(sql), params or {})
 

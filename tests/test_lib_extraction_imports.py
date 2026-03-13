@@ -288,12 +288,6 @@ class TestSubpackageImports:
 
         assert callable(main)
 
-    def test_import_cli_backup(self) -> None:
-        """CLI backup module imports cleanly."""
-        from db_adapter.cli.backup import main as backup_main
-
-        assert callable(backup_main)
-
 
 # ============================================================================
 # Test: adapters/__init__.py references correct module names
@@ -318,23 +312,6 @@ class TestAdaptersInitCorrectness:
         init_path = SRC_ROOT / "adapters" / "__init__.py"
         content = init_path.read_text()
         assert "db_adapter.adapters.base" in content
-
-
-# ============================================================================
-# Test: sys.path workaround removed from cli/backup.py
-# ============================================================================
-
-
-class TestSysPathRemoved:
-    """Verify sys.path.insert workaround is removed."""
-
-    def test_no_sys_path_insert_in_cli_backup(self) -> None:
-        """cli/backup.py must not have sys.path.insert workaround."""
-        backup_path = SRC_ROOT / "cli" / "backup.py"
-        content = backup_path.read_text()
-        assert "sys.path.insert" not in content, (
-            "cli/backup.py still has sys.path.insert workaround"
-        )
 
 
 # ============================================================================

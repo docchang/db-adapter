@@ -1,35 +1,552 @@
 # db-adapter
 
-An async-first, dict-based database adapter library for Python with Protocol typing, multi-profile configuration, schema management, and backup/restore.
+Async-first database adapter toolkit for Python. Multi-profile config, schema validation and auto-fix, cross-profile data sync, and backup/restore with FK remapping.
 
-Like SQLAlchemy gives you the engine, db-adapter gives you a clean async CRUD interface + tooling on top of it.
+* Protocol-typed `DatabaseClient` with PostgreSQL and Supabase implementations — all CRUD returns plain dicts
+* `transaction()` async context manager for atomic batches — auto-commits on success, rolls back on exception
+* TOML-based multi-profile config with profile lock files and config-driven CLI defaults
+* Schema introspection via `pg_catalog`, set-based validation, and atomic auto-fix (ALTER/DROP+CREATE)
+* Cross-profile data sync with FK pre-flight warnings and per-table transactions
+* JSON backup/restore with declarative table hierarchy (`BackupSchema`) and automatic FK ID remapping
+* `sqlparse`-based SQL file parsing — handles quoted identifiers, schema-qualified names, and comments
+* 8 CLI subcommands with Rich table output and graceful degradation on errors
 
-## Features
+## Table of Contents
 
-- **Async-first** — All database operations are `async def`. CLI wraps with `asyncio.run()`.
-- **Protocol-typed adapters** — `DatabaseClient` protocol with PostgreSQL and Supabase implementations. All CRUD methods return plain dicts.
-- **Multi-profile config** — TOML-based profiles (`local`, `rds`, `docker`, etc.) with profile lock files for validated connections.
-- **Schema introspection** — Full database schema extraction via `information_schema` and `pg_catalog` (tables, columns, constraints, indexes, triggers, functions).
-- **Schema validation & fix** — Set-based comparison of expected vs actual schema. Auto-fix with ALTER/DROP+CREATE and FK-aware topological ordering.
-- **Cross-profile data sync** — Compare and sync data between database profiles with direct insert or FK-aware backup/restore paths.
-- **Backup/restore** — JSON-based backup with declarative table hierarchy (`BackupSchema`) and FK ID remapping on restore.
-- **CLI** — `db-adapter connect|status|profiles|validate|fix|sync`
+- [Getting started](#getting-started)
+- [Configuration](#configuration)
+- [Connecting and Profiles](#connecting-and-profiles)
+- [Schema Validation](#schema-validation)
+- [Schema Fix](#schema-fix)
+- [Data Sync](#data-sync)
+- [Backup and Restore](#backup-and-restore)
+- [Adapter API](#adapter-api)
+- [Transactions](#transactions)
+- [Development](#development)
+- [License](#license)
 
-## Installation
+## Getting started
 
 Requires Python 3.12+.
 
 ```bash
-# From source
 uv add git+ssh://git@github.com/docchang/db-adapter.git
 
 # With Supabase support
 uv add "db-adapter[supabase] @ git+ssh://git@github.com/docchang/db-adapter.git"
 ```
 
-## Quick Start
+Create a `db.toml` in your project root:
 
-### Direct adapter usage
+```toml
+[profiles.local]
+url = "postgresql://user:pass@localhost:5432/mydb"
+description = "Local development"
+provider = "postgres"
+
+[schema]
+file = "schema.sql"
+validate_on_connect = true
+```
+
+Connect and validate:
+
+```bash
+$ DB_PROFILE=local db-adapter connect
+
+v Connected to profile: local
+  Schema validation: PASSED
+
+     Table Data
+┏━━━━━━━━━━━━┳━━━━━━┓
+┃ Table      ┃ Rows ┃
+┡━━━━━━━━━━━━╇━━━━━━┩
+│ categories │    3 │
+│ items      │    5 │
+│ products   │    5 │
+└────────────┴──────┘
+```
+
+This writes a `.db-profile` lock file. All subsequent commands use it automatically — no need to pass the profile name again.
+
+## Configuration
+
+All CLI commands read defaults from `db.toml`. With full configuration, most flags can be omitted.
+
+```toml
+[profiles.local]
+url = "postgresql://user:pass@localhost:5432/mydb"
+description = "Local development"
+provider = "postgres"
+
+[profiles.rds]
+url = "postgresql://user:pass@rds-host:5432/mydb"
+description = "AWS RDS production"
+db_password = "secret"         # overrides password in URL
+provider = "postgres"
+
+[schema]
+file = "schema.sql"              # SQL file with CREATE TABLE statements
+validate_on_connect = true       # validate schema on `db-adapter connect`
+column_defs = "column-defs.json" # column type definitions for schema fix
+backup_schema = "backup-schema.json"  # table hierarchy for backup/restore
+
+[sync]
+tables = ["users", "orders", "items"]  # default tables for sync command
+
+[defaults]
+user_id_env = "DEV_USER_ID"      # env var name for user_id resolution
+```
+
+**Flag resolution order**: CLI flag → `db.toml` config → error. For example, `--schema-file schema.sql` overrides `schema.file` in config.
+
+**User ID resolution**: `--user-id` flag → env var named in `defaults.user_id_env` → error.
+
+### Backup Schema JSON
+
+The `backup_schema` file declares your table hierarchy for backup, restore, and FK-aware sync:
+
+```json
+{
+    "tables": [
+        {
+            "name": "categories",
+            "pk": "id",
+            "slug_field": "slug",
+            "user_field": "user_id"
+        },
+        {
+            "name": "products",
+            "pk": "id",
+            "slug_field": "slug",
+            "user_field": "user_id",
+            "parent": {
+                "table": "categories",
+                "field": "category_id"
+            }
+        }
+    ]
+}
+```
+
+Parent tables are backed up and restored first. The `parent.field` tells the restore engine which column in the child table references the parent's PK, enabling automatic FK ID remapping.
+
+### Column Definitions JSON
+
+The `column_defs` file maps `"table.column"` to SQL type definitions for `ALTER TABLE` when fixing schema drift:
+
+```json
+{
+    "items.b": "VARCHAR(100) NOT NULL",
+    "items.e": "BOOLEAN DEFAULT FALSE",
+    "products.price": "INTEGER DEFAULT 0"
+}
+```
+
+### Env Prefix
+
+For projects that namespace their env vars:
+
+```bash
+# Default: reads DB_PROFILE env var
+$ DB_PROFILE=local db-adapter connect
+
+# With prefix: reads MC_DB_PROFILE env var
+$ MC_DB_PROFILE=local db-adapter --env-prefix MC_ connect
+```
+
+The `--env-prefix` flag works with all commands and also affects the library's `get_adapter(env_prefix="MC_")`.
+
+## Connecting and Profiles
+
+### `db-adapter connect`
+
+Connect to a profile, validate schema (if configured), and display table row counts:
+
+```bash
+$ DB_PROFILE=local db-adapter connect
+
+v Connected to profile: local
+  Schema validation: PASSED
+
+     Table Data
+┏━━━━━━━━━━━━┳━━━━━━┓
+┃ Table      ┃ Rows ┃
+┡━━━━━━━━━━━━╇━━━━━━┩
+│ categories │    3 │
+│ items      │    5 │
+│ products   │    5 │
+└────────────┴──────┘
+```
+
+When the schema has drifted, connect reports what's missing and exits with code 1:
+
+```bash
+$ DB_PROFILE=drift db-adapter connect
+
+x Connected to profile: drift
+
+Schema validation report:
+Schema validation failed:
+
+  Missing columns (5):
+    - items.b
+    - items.e
+    - items.f
+    - products.active
+    - products.price
+```
+
+> The `.db-profile` lock file is only written on successful validation. A failed connect does not change the current profile.
+
+### `db-adapter status`
+
+Show the current profile and live table row counts without re-validating:
+
+```bash
+$ db-adapter status
+
+               Connection Status
+┌─────────────────┬───────────────────────────┐
+│ Current profile │ local                     │
+│ Profile source  │ .db-profile (validated)   │
+│ Provider        │ postgres                  │
+│ Description     │ Local development         │
+└─────────────────┴───────────────────────────┘
+
+     Table Data
+┏━━━━━━━━━━━━┳━━━━━━┓
+┃ Table      ┃ Rows ┃
+┡━━━━━━━━━━━━╇━━━━━━┩
+│ categories │    3 │
+│ items      │    5 │
+│ products   │    5 │
+└────────────┴──────┘
+```
+
+Row counts are best-effort — if the database is unreachable, status still shows the profile info from the lock file and config.
+
+### `db-adapter profiles`
+
+List all profiles from `db.toml` with the current profile marked:
+
+```bash
+$ db-adapter profiles
+
+                      Database Profiles
+┏━━━━┳━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃    ┃ Profile ┃ Provider ┃ Description            ┃
+┡━━━━╇━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ *  │ local   │ postgres │ Local development      │
+│    │ rds     │ postgres │ AWS RDS production     │
+└────┴─────────┴──────────┴────────────────────────┘
+
+* = current profile
+```
+
+## Schema Validation
+
+### `db-adapter validate`
+
+Check if the current database matches your `schema.sql`:
+
+```bash
+$ db-adapter validate
+
+Validating schema for profile: local
+v Schema is valid
+```
+
+Use `--schema-file` to override the config:
+
+```bash
+$ db-adapter validate --schema-file other-schema.sql
+```
+
+When the schema has drifted, the report lists every missing column:
+
+```bash
+$ db-adapter validate
+
+x Connected to profile: drift
+
+Schema validation report:
+Schema validation failed:
+
+  Missing columns (5):
+    - items.b
+    - items.e
+    - items.f
+    - products.active
+    - products.price
+```
+
+> Validate does not overwrite the `.db-profile` lock file — it's a read-only check.
+
+### Programmatic validation
+
+```python
+from db_adapter import validate_schema
+from db_adapter.schema import SchemaIntrospector
+
+async with SchemaIntrospector(url) as introspector:
+    actual = await introspector.get_column_names()
+
+result = validate_schema(actual, {"users": {"id", "name", "email"}})
+# result.valid, result.missing_columns, result.extra_tables
+```
+
+## Schema Fix
+
+### `db-adapter fix`
+
+Detect and repair schema drift. Preview by default, apply with `--confirm`:
+
+```bash
+$ db-adapter fix
+
+Analyzing schema for profile: drift
+
+      Schema Differences
+┏━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━┓
+┃ Table    ┃ Column   ┃ Type ┃
+┡━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━┩
+│ items    │ RECREATE │      │
+│ products │ RECREATE │      │
+└──────────┴──────────┴──────┘
+
+Execution Plan:
+  1. DROP TABLES products, items
+  2. CREATE TABLE items
+  3. CREATE TABLE products
+
+To apply fixes, add --confirm flag.
+```
+
+```bash
+$ db-adapter fix --confirm
+
+Applying fixes...
+v Schema fix complete!
+  Tables recreated: 2
+```
+
+Fix operations are wrapped in a database transaction — if any step fails, all DDL rolls back atomically (PostgreSQL's transactional DDL). When `backup_schema` is configured, a pre-fix backup is created automatically before any destructive changes.
+
+**Fix strategy**: 1 missing column triggers `ALTER TABLE ADD COLUMN`. 2+ missing columns triggers `DROP TABLE` + `CREATE TABLE` (with auto-backup first). Tables are ordered by FK dependencies — parents created before children, children dropped before parents.
+
+| Flag | Purpose |
+|------|---------|
+| `--schema-file` | SQL file with CREATE TABLE statements (default: `schema.file`) |
+| `--column-defs` | JSON mapping `"table.column"` to SQL type (default: `schema.column_defs`) |
+| `--confirm` | Apply fixes (without this, only previews) |
+| `--no-backup` | Skip automatic pre-fix backup |
+
+## Data Sync
+
+### `db-adapter sync`
+
+Compare and sync data from one profile to the current profile:
+
+```bash
+$ db-adapter sync --from rds --dry-run
+
+Warning: Tables products have foreign key constraints.
+Direct sync does not handle FK remapping. Consider configuring
+backup_schema in db.toml for FK-aware sync.
+
+Comparing profiles...
+  Source: rds
+  Destination: local
+  Tables: categories, products
+
+               Data Comparison
+┏━━━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃            ┃ rds (source) ┃ local (dest)  ┃
+┡━━━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ categories │            2 │             3 │
+│ products   │            0 │             5 │
+└────────────┴──────────────┴───────────────┘
+
+DRY RUN - No changes made.
+```
+
+The FK pre-flight warning appears when target tables have foreign key constraints and no `backup_schema` is configured. It's advisory only — sync proceeds after the warning.
+
+```bash
+$ db-adapter sync --from rds --confirm
+
+Syncing data...
+v Sync complete.
+```
+
+Each table's inserts are wrapped in a per-table transaction. If a table's sync fails (e.g., FK violation), that table rolls back while previously synced tables remain committed.
+
+| Flag | Purpose |
+|------|---------|
+| `--from` / `-f` | Source profile name (required) |
+| `--tables` | Comma-separated table list (default: `sync.tables`) |
+| `--user-id` | User ID for filtering (default: env var from `defaults.user_id_env`) |
+| `--dry-run` | Preview without changes |
+| `--confirm` | Execute the sync |
+
+### Programmatic sync
+
+```python
+from db_adapter.schema import compare_profiles, sync_data
+
+# Compare what would be synced
+result = await compare_profiles("rds", "local", tables=["users"], user_id="user-123")
+# result.source_counts, result.dest_counts, result.sync_plan
+
+# Execute sync
+result = await sync_data("rds", "local", tables=["users"], user_id="user-123", confirm=True)
+
+# FK-aware sync via backup/restore path
+result = await sync_data("rds", "local", tables=["users"], user_id="user-123",
+                         schema=backup_schema, confirm=True)
+```
+
+## Backup and Restore
+
+### `db-adapter backup`
+
+Create a JSON backup of user-scoped data:
+
+```bash
+$ db-adapter backup
+
+v Backup saved to: backups/local-20260313-121500.json
+  categories: backed up
+  products: backed up
+```
+
+Backup a subset of tables:
+
+```bash
+$ db-adapter backup --tables categories -o backups/cats-only.json
+```
+
+Validate an existing backup file (no database connection needed):
+
+```bash
+$ db-adapter backup --validate backup.json
+
+v Backup is valid: backup.json
+```
+
+When validation fails:
+
+```bash
+$ db-adapter backup --validate bad-backup.json
+
+x Backup is invalid: bad-backup.json
+
+Errors:
+  - Missing required key: metadata
+  - Missing required key: categories
+  - Missing required key: products
+```
+
+| Flag | Purpose |
+|------|---------|
+| `--backup-schema` | BackupSchema JSON (default: `schema.backup_schema`) |
+| `--user-id` | User ID for filtering (default: env var from `defaults.user_id_env`) |
+| `--output` / `-o` | Output file path |
+| `--tables` | Comma-separated table subset |
+| `--validate` | Validate existing backup instead of creating one |
+
+### `db-adapter restore`
+
+Restore from a backup file with FK ID remapping:
+
+```bash
+$ db-adapter restore backup.json --dry-run
+
+DRY RUN - No changes made.
+  Mode: skip
+
+                   Restore Results
+┏━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━┓
+┃ Table      ┃ Inserted ┃ Updated ┃ Skipped ┃ Failed ┃
+┡━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━┩
+│ categories │        0 │       0 │       3 │      0 │
+│ products   │        0 │       0 │       5 │      0 │
+└────────────┴──────────┴─────────┴─────────┴────────┘
+```
+
+```bash
+$ db-adapter restore backup.json --mode overwrite --yes
+
+v Restore complete.
+  Mode: overwrite
+
+                   Restore Results
+┏━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━┓
+┃ Table      ┃ Inserted ┃ Updated ┃ Skipped ┃ Failed ┃
+┡━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━┩
+│ categories │        0 │       3 │       0 │      0 │
+│ products   │        0 │       5 │       0 │      0 │
+└────────────┴──────────┴─────────┴─────────┴────────┘
+```
+
+When rows fail, per-row error details are shown below the table:
+
+```
+  Failed rows in products:
+    row 2 (pk=c3d4): IntegrityError: duplicate key value violates unique constraint
+```
+
+**Conflict modes**:
+
+| Mode | Behavior |
+|------|----------|
+| `skip` (default) | Skip existing rows, insert new ones |
+| `overwrite` | Update existing rows with backup data |
+| `fail` | Abort on any duplicate — rolls back the entire restore |
+
+Restore is wrapped in a transaction. FK IDs are remapped automatically — child records point to the newly created parent IDs, not the original ones from the backup.
+
+| Flag | Purpose |
+|------|---------|
+| `--backup-schema` | BackupSchema JSON (default: `schema.backup_schema`) |
+| `--user-id` | User ID for filtering |
+| `--mode` / `-m` | Conflict resolution: `skip`, `overwrite`, or `fail` |
+| `--dry-run` | Preview without changes |
+| `--yes` / `-y` | Skip confirmation prompt |
+
+### Programmatic backup/restore
+
+```python
+from db_adapter import AsyncPostgresAdapter, BackupSchema, TableDef, ForeignKey
+from db_adapter.backup import backup_database, restore_database, validate_backup
+
+schema = BackupSchema(tables=[
+    TableDef(name="categories", pk="id", slug_field="slug", user_field="user_id"),
+    TableDef(name="products", pk="id", slug_field="slug", user_field="user_id",
+             parent=ForeignKey(table="categories", field="category_id")),
+])
+
+adapter = AsyncPostgresAdapter("postgresql://user:pass@localhost/mydb")
+
+# Backup
+path = await backup_database(adapter, schema, user_id="user-123")
+
+# Validate (sync, no DB connection)
+report = validate_backup(path, schema)
+# report["valid"], report["errors"], report["warnings"]
+
+# Restore with FK ID remapping
+result = await restore_database(adapter, schema, path, user_id="user-123", mode="skip")
+# result["categories"] = {"inserted": 3, "updated": 0, "skipped": 0, "failed": 0}
+# result["categories"]["failure_details"] = [{"row_index": 0, "old_pk": "abc", "error": "..."}]
+
+await adapter.close()
+```
+
+## Adapter API
+
+For programmatic database access without the CLI.
 
 ```python
 import asyncio
@@ -42,12 +559,13 @@ async def main():
     )
 
     # Select
-    rows = await adapter.select("users", "id, name, email", filters={"active": True}, order_by="name")
+    rows = await adapter.select("users", "id, name, email",
+                                filters={"active": True}, order_by="name")
 
-    # Insert
+    # Insert — returns the created row as a dict
     user = await adapter.insert("users", {"name": "Alice", "email": "alice@example.com"})
 
-    # Update
+    # Update — returns the updated row as a dict
     updated = await adapter.update("users", {"name": "Bob"}, filters={"id": user["id"]})
 
     # Delete
@@ -61,264 +579,86 @@ async def main():
 asyncio.run(main())
 ```
 
-### Factory with profiles
-
-Create a `db.toml` in your project root:
-
-```toml
-[profiles.local]
-url = "postgresql://user:pass@localhost:5432/mydb"
-description = "Local development"
-provider = "postgres"
-
-[profiles.rds]
-url = "postgresql://user:[YOUR-PASSWORD]@rds-host:5432/mydb"
-description = "AWS RDS production"
-db_password = "secret"
-provider = "postgres"
-
-[schema]
-file = "schema.sql"              # Path to SQL file with CREATE TABLE statements
-validate_on_connect = true       # Validate schema on `db-adapter connect`
-```
-
-Use the factory to create adapters:
+### Factory (profile-based)
 
 ```python
-import asyncio
 from db_adapter import get_adapter, connect_and_validate
 
-async def main():
-    # Option 1: Direct URL (no db.toml needed)
-    adapter = await get_adapter(database_url="postgresql://user:pass@localhost/mydb")
+# Direct URL (no db.toml needed)
+adapter = await get_adapter(database_url="postgresql://user:pass@localhost/mydb")
 
-    # Option 2: Profile-based (reads db.toml)
-    adapter = await get_adapter(profile_name="local")
+# Profile from db.toml
+adapter = await get_adapter(profile_name="local")
 
-    # Option 3: Env var resolution (reads DB_PROFILE env var, then .db-profile lock file)
-    adapter = await get_adapter()
-
-    # Option 4: Connect with schema validation first
-    expected = {"users": {"id", "name", "email"}, "orders": {"id", "total", "user_id"}}
-    result = await connect_and_validate("local", expected_columns=expected)
-    if result.success:
-        adapter = await get_adapter(profile_name="local")
-
-    rows = await adapter.select("users", "*")
-    await adapter.close()
-
-asyncio.run(main())
-```
-
-Connect and validate via CLI:
-
-```bash
-DB_PROFILE=local db-adapter connect
-```
-
-### Schema validation
-
-```python
-from db_adapter import validate_schema
-from db_adapter.schema import SchemaIntrospector
-
-async def check_schema(url: str):
-    expected = {
-        "users": {"id", "name", "email", "created_at"},
-        "orders": {"id", "user_id", "total", "status"},
-    }
-
-    async with SchemaIntrospector(url) as introspector:
-        actual = await introspector.get_column_names()
-
-    result = validate_schema(actual, expected)
-    if result.valid:
-        print("Schema OK")
-    else:
-        for diff in result.missing_columns:
-            print(f"Missing: {diff.table}.{diff.column}")
-```
-
-### Backup & restore
-
-Declare your table hierarchy with `BackupSchema`:
-
-```python
-import asyncio
-from db_adapter import AsyncPostgresAdapter, BackupSchema, TableDef, ForeignKey
-from db_adapter.backup import backup_database, restore_database, validate_backup
-
-schema = BackupSchema(tables=[
-    TableDef(name="authors", pk="id", slug_field="slug", user_field="user_id"),
-    TableDef(name="books", pk="id", slug_field="slug", user_field="user_id",
-             parent=ForeignKey(table="authors", field="author_id")),
-    TableDef(name="chapters", pk="id", slug_field="slug", user_field="user_id",
-             parent=ForeignKey(table="books", field="book_id")),
-])
-
-async def main():
-    adapter = AsyncPostgresAdapter("postgresql://user:pass@localhost/mydb")
-
-    # Backup
-    path = await backup_database(adapter, schema, user_id="user-123")
-
-    # Validate backup file (sync -- local file read only)
-    report = validate_backup(path, schema)
-
-    # Restore with FK ID remapping
-    summary = await restore_database(adapter, schema, path, user_id="user-123")
-
-    await adapter.close()
-
-asyncio.run(main())
-```
-
-FK IDs are remapped automatically during restore — child records point to newly created parent IDs.
-
-### Cross-profile data sync
-
-```python
-import asyncio
-from db_adapter.schema import compare_profiles, sync_data
-
-async def main():
-    # Compare what would be synced
-    result = await compare_profiles(
-        "rds", "local",
-        tables=["authors", "books"],
-        user_id="user-123",
-    )
-    print(f"Source: {result.source_counts}, Dest: {result.dest_counts}")
-
-    # Direct sync (flat tables, no FK remapping)
-    result = await sync_data(
-        "rds", "local",
-        tables=["authors", "books"],
-        user_id="user-123",
-        dry_run=False,
-        confirm=True,
-    )
-
-    # FK-aware sync with BackupSchema
-    result = await sync_data(
-        "rds", "local",
-        tables=["authors", "books"],
-        user_id="user-123",
-        schema=schema,  # enables backup/restore path with ID remapping
-        dry_run=False,
-        confirm=True,
-    )
-
-asyncio.run(main())
-```
-
-### Configurable env prefix
-
-For projects that namespace their env vars:
-
-```python
-# Default: reads DB_PROFILE env var
+# Env var resolution (reads DB_PROFILE, then .db-profile lock file)
 adapter = await get_adapter()
 
-# With prefix: reads MC_DB_PROFILE env var
+# With env prefix (reads MC_DB_PROFILE)
 adapter = await get_adapter(env_prefix="MC_")
 ```
 
-```bash
-# CLI equivalent
-db-adapter --env-prefix MC_ connect
+### DatabaseClient Protocol
+
+`DatabaseClient` is a `typing.Protocol` — adapters implement it structurally, no inheritance needed:
+
+```python
+class DatabaseClient(Protocol):
+    async def select(self, table, columns, filters=None, order_by=None) -> list[dict]: ...
+    async def insert(self, table, data) -> dict: ...
+    async def update(self, table, data, filters) -> dict: ...
+    async def delete(self, table, filters) -> None: ...
+    async def execute(self, sql, params=None) -> None: ...
+    def transaction(self) -> AbstractAsyncContextManager[None]: ...
+    async def close(self) -> None: ...
 ```
 
-## Architecture
+## Transactions
 
-```
-db-adapter/
-├── src/db_adapter/
-│   ├── __init__.py           # Public API exports
-│   ├── factory.py            # get_adapter(), connect_and_validate() (async)
-│   ├── adapters/
-│   │   ├── base.py           # DatabaseClient Protocol (async)
-│   │   ├── postgres.py       # AsyncPostgresAdapter (SQLAlchemy + asyncpg)
-│   │   └── supabase.py       # AsyncSupabaseAdapter (supabase-py async client)
-│   ├── config/
-│   │   ├── models.py         # DatabaseProfile, DatabaseConfig
-│   │   └── loader.py         # TOML parser for db.toml
-│   ├── schema/
-│   │   ├── models.py         # ColumnSchema, SchemaValidationResult, ConnectionResult, etc.
-│   │   ├── introspector.py   # SchemaIntrospector (async psycopg)
-│   │   ├── comparator.py     # validate_schema(actual, expected) — pure sync logic
-│   │   ├── fix.py            # generate_fix_plan(), apply_fixes() (async)
-│   │   └── sync.py           # compare_profiles(), sync_data() (async)
-│   ├── backup/
-│   │   ├── models.py         # BackupSchema, TableDef, ForeignKey
-│   │   └── backup_restore.py # backup_database(), restore_database() (async)
-│   └── cli/
-│       ├── __init__.py       # Main CLI (connect, status, profiles, validate, fix, sync)
-│       └── backup.py         # Standalone backup CLI
-└── tests/                    # 704 tests
+`transaction()` returns an async context manager that wraps all CRUD operations in a single database transaction:
+
+```python
+async with adapter.transaction():
+    await adapter.insert("orders", {"user_id": "u1", "total": 99.99})
+    await adapter.update("users", {"order_count": 1}, filters={"id": "u1"})
+    # Both committed atomically on success
+    # If either raises, both roll back
 ```
 
-### Key design decisions
+Transactions are used internally by `restore_database()` (wraps entire multi-table restore), `apply_fixes()` (wraps all DDL — DROP, CREATE, ALTER), and `_sync_direct()` (wraps each table's inserts).
 
-- **Protocol, not inheritance** — `DatabaseClient` is a `typing.Protocol`. Adapters implement it structurally without inheriting from a base class.
-- **Dicts, not ORMs** — All CRUD methods accept and return plain dicts. No model classes required.
-- **Async-first** — All I/O operations are `async def`. CLI wraps with `asyncio.run()`. Schema comparator stays sync (pure set logic, no I/O).
-- **JSONB handling** — `AsyncPostgresAdapter` serializes dict/list values to JSON strings with `CAST(:param AS jsonb)` for JSONB columns. Configurable via constructor parameter.
-- **Profile lock file** — `.db-profile` stores the validated profile name. Written only after successful schema validation. Prevents connecting to unvalidated databases.
-- **Set-based validation** — Schema comparator uses pure set operations (expected columns vs actual columns). No SQL generation — just reports diffs.
-- **FK-aware operations** — Backup/restore and sync use `BackupSchema` for declarative FK relationships with automatic ID remapping.
+The implementation uses `contextvars` — each adapter instance gets its own `ContextVar`, so multiple adapters in the same asyncio task don't interfere with each other. Nested transactions raise `RuntimeError`.
 
-## CLI Reference
+`AsyncSupabaseAdapter.transaction()` raises `NotImplementedError` — Supabase's REST API has no transaction semantics.
 
-```bash
-db-adapter connect                                                    # Connect + validate schema (uses schema.file and validate_on_connect from db.toml)
-db-adapter status                                                     # Show current profile
-db-adapter profiles                                                   # List available profiles
-db-adapter validate                                                   # Re-validate current profile (uses schema.file from db.toml)
-db-adapter validate --schema-file schema.sql                          # Re-validate with explicit schema file
-db-adapter fix --column-defs defs.json                                # Preview schema fix (uses schema.file from db.toml)
-db-adapter fix --schema-file schema.sql --column-defs defs.json       # Preview schema fix with explicit schema file
-db-adapter fix --column-defs defs.json --confirm                      # Apply schema fix
-db-adapter sync --from rds --tables users,orders --user-id abc --dry-run   # Preview sync
-db-adapter sync --from rds --tables users,orders --user-id abc --confirm   # Execute sync
-db-adapter --env-prefix MC_ connect                                   # Use MC_DB_PROFILE env var
-```
+> When an adapter doesn't support transactions (Supabase, custom adapters), the library falls back to non-transactional behavior automatically — same as before, just without atomicity guarantees.
 
 ## Development
 
 ```bash
-# Clone and install
 git clone git@github.com:docchang/db-adapter.git
 cd db-adapter
 uv sync --extra dev
 
-# Install with Supabase support
-uv sync --extra supabase
-
-# Run all tests (704 tests)
+# Run all tests (828 tests)
 uv run pytest
 
 # Run a single test file
 uv run pytest tests/test_lib_extraction_adapters.py
 
-# Run a single test
-uv run pytest tests/test_lib_extraction_adapters.py::test_name
-
 # Run with verbose output
 uv run pytest -v
 ```
 
-Tests use `pytest-asyncio` with `asyncio_mode = "auto"` — async test functions are detected automatically.
+Tests use `pytest-asyncio` with `asyncio_mode = "auto"`.
 
-## Dependencies
-
-| Package | Purpose |
-|---------|---------|
+| Dependency | Purpose |
+|------------|---------|
 | `sqlalchemy[asyncio]` | Async engine + connection pooling |
-| `asyncpg` | Async PostgreSQL driver |
-| `psycopg[binary]` | Async PostgreSQL introspection |
-| `pydantic` | Models and validation |
-| `rich` | CLI output formatting |
+| `asyncpg` | PostgreSQL driver for SQLAlchemy |
+| `psycopg[binary]` | PostgreSQL introspection + row counts |
+| `pydantic` | Config and schema models |
+| `rich` | CLI table formatting |
+| `sqlparse` | SQL file parsing |
 | `supabase` *(optional)* | Supabase async adapter |
 
 ## License

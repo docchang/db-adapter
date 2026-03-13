@@ -13,6 +13,7 @@ Usage:
         await client.close()
 """
 
+from contextlib import AbstractAsyncContextManager
 from typing import Any, Protocol
 
 
@@ -127,6 +128,26 @@ class DatabaseClient(Protocol):
             await client.execute(
                 "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
             )
+        """
+        ...
+
+    def transaction(self) -> AbstractAsyncContextManager[None]:
+        """Enter a transaction. Auto-commits on clean exit, auto-rolls back on exception.
+
+        Returns an async context manager that wraps all CRUD operations
+        within a single database transaction.  On clean exit the transaction
+        commits; if an exception propagates out, it rolls back.
+
+        Example:
+            async with adapter.transaction():
+                await adapter.insert("users", {"name": "Alice"})
+                await adapter.update("users", {"status": "active"}, {"name": "Alice"})
+                # Both committed atomically on success
+
+        Raises:
+            RuntimeError: If called while already inside a transaction
+                (nested transactions are not supported).
+            NotImplementedError: If the adapter does not support transactions.
         """
         ...
 

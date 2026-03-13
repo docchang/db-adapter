@@ -26,11 +26,16 @@ Usage:
 import re
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import sqlparse
 from pydantic import BaseModel
+from sqlparse.sql import Identifier as SqlIdentifier
+from sqlparse.sql import Parenthesis
+from sqlparse.tokens import Keyword
 
 from db_adapter.schema.models import SchemaValidationResult
 
@@ -160,6 +165,13 @@ class FixResult(BaseModel):
 def _get_table_create_sql(table_name: str, schema_file: str | Path) -> str:
     """Get CREATE TABLE SQL for a table from a schema file.
 
+    Uses ``sqlparse`` to tokenize the SQL and find the matching CREATE TABLE
+    statement. Handles schema-qualified names (``public.users``), quoted
+    identifiers (``"Items"``), and correctly ignores commented-out statements.
+
+    Returns the raw SQL string of the matched statement, preserving original
+    formatting including any comments within the statement body.
+
     Args:
         table_name: Name of the table to get CREATE SQL for.
         schema_file: Path to the SQL schema file.  Required -- there is
@@ -181,20 +193,47 @@ def _get_table_create_sql(table_name: str, schema_file: str | Path) -> str:
         raise FileNotFoundError(f"Schema file not found: {schema_path}")
 
     content = schema_path.read_text()
+    statements = sqlparse.parse(content)
 
-    # Extract CREATE TABLE statement for this table
-    # Handle both "CREATE TABLE" and "CREATE TABLE IF NOT EXISTS"
-    pattern = rf"CREATE TABLE(?:\s+IF NOT EXISTS)?\s+{table_name}\s*\([^;]+\);"
-    match = re.search(pattern, content, re.IGNORECASE | re.DOTALL)
+    target = table_name.lower()
 
-    if match:
-        return match.group(0)
+    for stmt in statements:
+        if stmt.get_type() != "CREATE":
+            continue
+
+        # Verify this is CREATE TABLE (not CREATE INDEX, CREATE VIEW, etc.)
+        has_table_keyword = False
+        for token in stmt.tokens:
+            if token.ttype is Keyword and token.normalized == "TABLE":
+                has_table_keyword = True
+                break
+        if not has_table_keyword:
+            continue
+
+        # Extract table name from Identifier token
+        for token in stmt.tokens:
+            if isinstance(token, SqlIdentifier):
+                raw_name = token.get_real_name()
+                if raw_name:
+                    # Strip quotes and compare lowercase
+                    extracted = raw_name.strip('"').strip("'").strip("`").lower()
+                    if extracted == target:
+                        return str(stmt).strip()
+                break
 
     raise ValueError(f"CREATE TABLE for {table_name} not found in {schema_path.name}")
 
 
 def _parse_fk_dependencies(schema_file: str | Path) -> dict[str, set[str]]:
     """Parse REFERENCES clauses from a schema file to build an FK dependency graph.
+
+    Uses ``sqlparse`` to tokenize CREATE TABLE statements and extract table
+    names. Handles schema-qualified names (``public.users``), quoted
+    identifiers (``"Items"``), and correctly ignores commented-out statements.
+
+    REFERENCES extraction uses regex within the tokenized body (comments
+    already stripped), handling schema-qualified references
+    (``REFERENCES public.users(id)`` -> ``users``).
 
     Returns a dict mapping table_name -> set of tables it depends on (references).
 
@@ -213,23 +252,50 @@ def _parse_fk_dependencies(schema_file: str | Path) -> dict[str, set[str]]:
         return {}
 
     content = schema_path.read_text()
+    statements = sqlparse.parse(content)
     dependencies: dict[str, set[str]] = {}
 
-    # Find all CREATE TABLE blocks
-    table_pattern = re.compile(
-        r"CREATE TABLE(?:\s+IF NOT EXISTS)?\s+(\w+)\s*\(([^;]+)\);",
-        re.IGNORECASE | re.DOTALL,
-    )
+    for stmt in statements:
+        if stmt.get_type() != "CREATE":
+            continue
 
-    for match in table_pattern.finditer(content):
-        table_name = match.group(1)
-        table_body = match.group(2)
+        # Verify this is CREATE TABLE
+        has_table_keyword = False
+        for token in stmt.tokens:
+            if token.ttype is Keyword and token.normalized == "TABLE":
+                has_table_keyword = True
+                break
+        if not has_table_keyword:
+            continue
+
+        # Extract table name from Identifier token
+        table_name = None
+        parenthesis = None
+        for token in stmt.tokens:
+            if isinstance(token, SqlIdentifier) and table_name is None:
+                raw_name = token.get_real_name()
+                if raw_name:
+                    table_name = raw_name.strip('"').strip("'").strip("`")
+            if isinstance(token, Parenthesis) and parenthesis is None:
+                parenthesis = token
+
+        if table_name is None or parenthesis is None:
+            continue
+
         dependencies[table_name] = set()
 
-        # Find all REFERENCES clauses within this table's body
-        ref_pattern = re.compile(r"REFERENCES\s+(\w+)\s*\(", re.IGNORECASE)
-        for ref_match in ref_pattern.finditer(table_body):
-            referenced_table = ref_match.group(1)
+        # Strip comments from body before extracting REFERENCES
+        body = sqlparse.format(str(parenthesis), strip_comments=True)
+
+        # Find all REFERENCES clauses -- handle schema-qualified and quoted names
+        # Matches: REFERENCES users(id), REFERENCES public.users(id),
+        #          REFERENCES "Users"(id), REFERENCES public."Users"(id)
+        ref_pattern = re.compile(
+            r'REFERENCES\s+(?:(?:"?\w+"?)\.)?("?\w+"?)\s*\(',
+            re.IGNORECASE,
+        )
+        for ref_match in ref_pattern.finditer(body):
+            referenced_table = ref_match.group(1).strip('"').strip("'").strip("`")
             if referenced_table != table_name:  # Skip self-references
                 dependencies[table_name].add(referenced_table)
 
@@ -377,6 +443,32 @@ def generate_fix_plan(
 # ------------------------------------------------------------------
 
 
+@asynccontextmanager
+async def _noop_transaction():
+    """No-op async context manager used when adapter lacks transaction support."""
+    yield
+
+
+def _get_transaction_ctx(adapter: "DatabaseClient"):
+    """Get a transaction context manager from the adapter, or a no-op fallback.
+
+    Safely handles adapters that:
+    - Don't have a ``transaction`` attribute at all
+    - Raise ``NotImplementedError`` from ``transaction()`` (e.g. Supabase)
+    - Return something that isn't an async context manager
+
+    Returns:
+        An async context manager (either the adapter's transaction or _noop_transaction).
+    """
+    try:
+        ctx = adapter.transaction()
+    except (AttributeError, NotImplementedError, TypeError):
+        return _noop_transaction()
+    if not hasattr(ctx, '__aenter__'):
+        return _noop_transaction()
+    return ctx
+
+
 async def apply_fixes(
     adapter: "DatabaseClient",
     plan: FixPlan,
@@ -441,84 +533,89 @@ async def apply_fixes(
         result.error = "Fix requires confirm=True"
         return result
 
+    # Use adapter.transaction() when available for atomic DDL;
+    # fall back to _noop_transaction() for adapters without support.
+    ctx = _get_transaction_ctx(adapter)
+
     try:
-        # Build lookup for ordered operations
-        missing_table_map = {tf.table: tf for tf in plan.missing_tables}
-        recreate_table_map = {tf.table: tf for tf in plan.tables_to_recreate}
+        async with ctx:
+            # Build lookup for ordered operations
+            missing_table_map = {tf.table: tf for tf in plan.missing_tables}
+            recreate_table_map = {tf.table: tf for tf in plan.tables_to_recreate}
 
-        # 1. Create missing tables in topological order (parents first)
-        tables_to_create = [t for t in plan.create_order if t in missing_table_map]
-        # Also include tables not in create_order (no FK deps)
-        for tf in plan.missing_tables:
-            if tf.table not in tables_to_create:
-                tables_to_create.append(tf.table)
+            # 1. Create missing tables in topological order (parents first)
+            tables_to_create = [t for t in plan.create_order if t in missing_table_map]
+            # Also include tables not in create_order (no FK deps)
+            for tf in plan.missing_tables:
+                if tf.table not in tables_to_create:
+                    tables_to_create.append(tf.table)
 
-        for table_name in tables_to_create:
-            table_fix = missing_table_map[table_name]
-            try:
-                await adapter.execute(table_fix.to_sql())
-            except NotImplementedError:
-                raise RuntimeError("DDL operations not supported for this adapter type")
-            result.tables_created += 1
+            for table_name in tables_to_create:
+                table_fix = missing_table_map[table_name]
+                try:
+                    await adapter.execute(table_fix.to_sql())
+                except NotImplementedError:
+                    raise RuntimeError("DDL operations not supported for this adapter type")
+                result.tables_created += 1
 
-        # 2. Recreate tables with multiple missing columns
-        # Drop in reverse topological order (children first)
-        tables_to_drop = [t for t in plan.drop_order if t in recreate_table_map]
-        for tf in plan.tables_to_recreate:
-            if tf.table not in tables_to_drop:
-                tables_to_drop.append(tf.table)
+            # 2. Recreate tables with multiple missing columns
+            # Drop in reverse topological order (children first)
+            tables_to_drop = [t for t in plan.drop_order if t in recreate_table_map]
+            for tf in plan.tables_to_recreate:
+                if tf.table not in tables_to_drop:
+                    tables_to_drop.append(tf.table)
 
-        backup_paths: dict[str, str] = {}
+            backup_paths: dict[str, str] = {}
 
-        for table_name in tables_to_drop:
-            # Backup before drop if callback provided
-            if backup_fn is not None:
-                backup_path = await backup_fn(adapter, table_name)
-                backup_paths[table_name] = backup_path
-                if result.backup_path is None:
-                    result.backup_path = backup_path
+            for table_name in tables_to_drop:
+                # Backup before drop if callback provided
+                if backup_fn is not None:
+                    backup_path = await backup_fn(adapter, table_name)
+                    backup_paths[table_name] = backup_path
+                    if result.backup_path is None:
+                        result.backup_path = backup_path
 
-            try:
-                await adapter.execute(f"DROP TABLE IF EXISTS {table_name} CASCADE;")
-            except NotImplementedError:
-                raise RuntimeError("DDL operations not supported for this adapter type")
+                try:
+                    await adapter.execute(f"DROP TABLE IF EXISTS {table_name} CASCADE;")
+                except NotImplementedError:
+                    raise RuntimeError("DDL operations not supported for this adapter type")
 
-        # Create in forward topological order (parents first)
-        tables_to_create_after_drop = [t for t in plan.create_order if t in recreate_table_map]
-        for tf in plan.tables_to_recreate:
-            if tf.table not in tables_to_create_after_drop:
-                tables_to_create_after_drop.append(tf.table)
+            # Create in forward topological order (parents first)
+            tables_to_create_after_drop = [t for t in plan.create_order if t in recreate_table_map]
+            for tf in plan.tables_to_recreate:
+                if tf.table not in tables_to_create_after_drop:
+                    tables_to_create_after_drop.append(tf.table)
 
-        for table_name in tables_to_create_after_drop:
-            table_fix = recreate_table_map[table_name]
-            try:
-                await adapter.execute(table_fix.to_sql())
-            except NotImplementedError:
-                raise RuntimeError("DDL operations not supported for this adapter type")
-            result.tables_recreated += 1
-
-        # Restore data if callback provided
-        if restore_fn is not None:
             for table_name in tables_to_create_after_drop:
-                if table_name in backup_paths:
-                    await restore_fn(adapter, backup_paths[table_name])
+                table_fix = recreate_table_map[table_name]
+                try:
+                    await adapter.execute(table_fix.to_sql())
+                except NotImplementedError:
+                    raise RuntimeError("DDL operations not supported for this adapter type")
+                result.tables_recreated += 1
 
-        # 3. Add single missing columns via ALTER
-        for col_fix in plan.missing_columns:
-            try:
-                await adapter.execute(col_fix.to_sql())
-            except NotImplementedError:
-                raise RuntimeError("DDL operations not supported for this adapter type")
-            result.columns_added += 1
+            # Restore data if callback provided
+            if restore_fn is not None:
+                for table_name in tables_to_create_after_drop:
+                    if table_name in backup_paths:
+                        await restore_fn(adapter, backup_paths[table_name])
 
-        # 4. Verify if callback provided
-        if verify_fn is not None:
-            verified = await verify_fn(adapter)
-            if not verified:
-                result.error = "Fix applied but verification failed"
-                return result
+            # 3. Add single missing columns via ALTER
+            for col_fix in plan.missing_columns:
+                try:
+                    await adapter.execute(col_fix.to_sql())
+                except NotImplementedError:
+                    raise RuntimeError("DDL operations not supported for this adapter type")
+                result.columns_added += 1
 
-        result.success = True
+            # 4. Verify if callback provided
+            if verify_fn is not None:
+                verified = await verify_fn(adapter)
+                if not verified:
+                    result.error = "Fix applied but verification failed"
+                    return result
+
+            result.success = True
 
     except RuntimeError:
         # Re-raise RuntimeError (DDL not supported) without wrapping

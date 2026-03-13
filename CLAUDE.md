@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+This workspace uses session agents. See `agents.md` for role definitions.
+
 ## Project Overview
 
 `db-adapter` is an async-first, dict-based database adapter library for Python. It provides a Protocol-typed CRUD interface over PostgreSQL (and optionally Supabase), with multi-profile config (TOML), schema introspection/validation/fix, data sync between profiles, and backup/restore with FK remapping.
@@ -60,7 +62,7 @@ pytest config: `asyncio_mode = "auto"` in pyproject.toml.
 
 1. **Adapters** (`adapters/`) — `DatabaseClient` Protocol + `AsyncPostgresAdapter` (SQLAlchemy async engine + asyncpg) + `AsyncSupabaseAdapter` (optional, supabase-py async). All CRUD methods return plain dicts.
 
-2. **Config** (`config/`) — TOML-based multi-profile configuration. `DatabaseProfile` and `DatabaseConfig` Pydantic models in `config/models.py`. `loader.py` parses `db.toml` from the consuming project's working directory.
+2. **Config** (`config/`) — TOML-based multi-profile configuration. `DatabaseProfile` and `DatabaseConfig` Pydantic models in `config/models.py`. `loader.py` parses `db.toml` from the consuming project's working directory. Config supports `[schema]` (file, validate_on_connect, column_defs, backup_schema), `[sync]` (tables), and `[defaults]` (user_id_env) sections for CLI defaults.
 
 3. **Factory** (`factory.py`) — Async profile resolution and adapter creation. `get_adapter()` creates adapters (no caching — callers can cache). `connect_and_validate()` introspects the live DB, validates schema, writes `.db-profile` lock file. Reads `{env_prefix}DB_PROFILE` env var or `.db-profile` lock file.
 
@@ -84,21 +86,65 @@ All code uses **absolute package imports**: `from db_adapter.adapters.base impor
 
 ### CLI Commands
 
+All 8 subcommands support config-driven defaults from `db.toml`. When `[schema]`, `[sync]`, and `[defaults]` sections are configured, common flags can be omitted.
+
 ```bash
-db-adapter connect                                                    # Connect + validate schema (reads schema.file and validate_on_connect from db.toml)
-db-adapter status                                                     # Show current profile (local files only)
+# Profile management
+db-adapter connect                                                    # Connect + validate schema + show table row counts
+db-adapter status                                                     # Show current profile and table row counts (queries DB with graceful degradation)
 db-adapter profiles                                                   # List profiles from db.toml
 db-adapter validate                                                   # Re-validate current profile (uses schema.file from db.toml)
 db-adapter validate --schema-file schema.sql                          # Re-validate with explicit schema file (overrides config)
-db-adapter fix --column-defs defs.json                                # Preview schema fix (--schema-file defaults to schema.file in db.toml)
-db-adapter fix --schema-file schema.sql --column-defs defs.json       # Preview schema fix with explicit schema file
-db-adapter fix --column-defs defs.json --confirm                      # Apply schema fix
-db-adapter sync --from rds --tables users,orders --user-id abc --dry-run   # Preview sync
-db-adapter sync --from rds --tables users,orders --user-id abc --confirm   # Execute sync
+
+# Schema fix (auto-backup before destructive changes when backup_schema configured)
+db-adapter fix                                                        # Preview schema fix (uses schema.file and column_defs from db.toml)
+db-adapter fix --schema-file schema.sql --column-defs defs.json       # Preview with explicit overrides
+db-adapter fix --confirm                                              # Apply schema fix (auto-backup if backup_schema configured)
+db-adapter fix --confirm --no-backup                                  # Apply without auto-backup
+
+# Cross-profile data sync
+db-adapter sync --from rds --dry-run                                  # Preview sync (uses tables and user_id from db.toml)
+db-adapter sync --from rds --confirm                                  # Execute sync
+db-adapter sync --from rds --tables users,orders --user-id abc --confirm   # Explicit overrides
+
+# Backup and restore
+db-adapter backup                                                     # Create backup (uses backup_schema and user_id from db.toml)
+db-adapter backup --tables items                                      # Backup specific tables only
+db-adapter backup --validate backup.json                              # Validate backup file (no DB connection)
+db-adapter restore backup.json --dry-run                              # Preview restore
+db-adapter restore backup.json --yes                                  # Restore without confirmation prompt
+db-adapter restore backup.json --mode overwrite --yes                 # Restore with overwrite mode
+
+# Env prefix
 db-adapter --env-prefix MC_ connect                                   # Use MC_DB_PROFILE env var
 ```
 
-Backup CLI is a separate entry point: `uv run python src/db_adapter/cli/backup.py backup|restore|validate`
+### db.toml Configuration
+
+```toml
+[profiles.local]
+url = "postgresql://user:pass@localhost:5432/mydb"
+description = "Local development"
+provider = "postgres"
+
+[profiles.rds]
+url = "postgresql://user:[YOUR-PASSWORD]@rds-host:5432/mydb"
+description = "AWS RDS production"
+db_password = "secret"
+provider = "postgres"
+
+[schema]
+file = "schema.sql"              # Path to SQL file with CREATE TABLE statements
+validate_on_connect = true       # Validate schema on `db-adapter connect`
+column_defs = "column-defs.json" # Column definitions for schema fix (default for --column-defs)
+backup_schema = "backup-schema.json"  # BackupSchema JSON for backup/restore/auto-backup
+
+[sync]
+tables = ["users", "orders", "items"]  # Default tables for sync command
+
+[defaults]
+user_id_env = "DEV_USER_ID"      # Env var name for user_id resolution
+```
 
 ### Public API (`db_adapter/__init__.py`)
 
@@ -127,7 +173,7 @@ BackupSchema, TableDef, ForeignKey
 | `adapters/base.py` | `DatabaseClient` Protocol (6 async methods: select, insert, update, delete, execute, close) |
 | `adapters/postgres.py` | `AsyncPostgresAdapter` — SQLAlchemy async engine + asyncpg, connection pooling, JSONB, URL normalization |
 | `adapters/supabase.py` | `AsyncSupabaseAdapter` — supabase-py async client with lazy init + asyncio.Lock |
-| `config/models.py` | `DatabaseProfile` (url, description, db_password, provider), `DatabaseConfig` (profiles, schema_file) |
+| `config/models.py` | `DatabaseProfile` (url, description, db_password, provider), `DatabaseConfig` (profiles, schema_file, column_defs, backup_schema, sync_tables, user_id_env) |
 | `config/loader.py` | `load_db_config()` — parses `db.toml` from CWD |
 | `factory.py` | `get_adapter()`, `connect_and_validate()`, profile lock file ops, URL resolution |
 | `schema/models.py` | `SchemaValidationResult`, `ConnectionResult`, `ColumnSchema`, `TableSchema`, `DatabaseSchema`, etc. |
@@ -137,8 +183,13 @@ BackupSchema, TableDef, ForeignKey
 | `schema/sync.py` | `compare_profiles()`, `sync_data()` — dual-path: direct insert or backup/restore |
 | `backup/models.py` | `BackupSchema`, `TableDef`, `ForeignKey` — declarative table hierarchy |
 | `backup/backup_restore.py` | `backup_database()`, `restore_database()`, `validate_backup()` |
-| `cli/__init__.py` | Main CLI entry point with argparse (connect, status, profiles, validate, fix, sync) |
-| `cli/backup.py` | Standalone backup CLI |
+| `cli/__init__.py` | Main CLI entry point with argparse (connect, status, profiles, validate, fix, sync, backup, restore) |
+
+---
+
+## Agent Roles
+
+Roles are **assigned per session** — do not assume any role unless the user explicitly activates it (e.g., "You are the examiner", "You are the git agent"). See `agents.md` for full role definitions.
 
 ---
 

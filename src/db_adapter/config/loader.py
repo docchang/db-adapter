@@ -50,8 +50,18 @@ def load_db_config(config_path: Path | None = None) -> DatabaseConfig:
     # Parse schema settings
     schema_settings: dict = data.get("schema", {})
 
+    # Parse sync settings
+    sync_settings: dict = data.get("sync", {})
+
+    # Parse defaults settings
+    defaults_settings: dict = data.get("defaults", {})
+
     return DatabaseConfig(
         profiles=profiles,
         schema_file=schema_settings.get("file", "schema.sql"),
         validate_on_connect=schema_settings.get("validate_on_connect", True),
+        column_defs=schema_settings.get("column_defs"),
+        backup_schema=schema_settings.get("backup_schema"),
+        sync_tables=sync_settings.get("tables"),
+        user_id_env=defaults_settings.get("user_id_env"),
     )

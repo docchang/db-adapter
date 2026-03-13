@@ -437,6 +437,96 @@ class TestFKDependencies:
         assert deps == {}
 
 
+class TestGetTableCreateSQLSqlparseEdgeCases:
+    """Edge-case tests for sqlparse-based _get_table_create_sql."""
+
+    def test_schema_qualified_table_name(self, tmp_path):
+        """Finds CREATE TABLE public.users when called with 'users'."""
+        schema = tmp_path / "schema.sql"
+        schema.write_text(textwrap.dedent("""\
+            CREATE TABLE public.users (
+                id TEXT PRIMARY KEY,
+                email TEXT NOT NULL
+            );
+        """))
+        sql = _get_table_create_sql("users", schema)
+        assert "users" in sql
+        assert "id TEXT PRIMARY KEY" in sql
+
+    def test_quoted_identifier_table_name(self, tmp_path):
+        """Finds CREATE TABLE "Items" when called with 'Items'."""
+        schema = tmp_path / "schema.sql"
+        schema.write_text(textwrap.dedent("""\
+            CREATE TABLE "Items" (
+                id TEXT PRIMARY KEY,
+                name TEXT
+            );
+        """))
+        sql = _get_table_create_sql("Items", schema)
+        assert "Items" in sql
+        assert "id TEXT PRIMARY KEY" in sql
+
+    def test_commented_out_create_table_ignored(self, tmp_path):
+        """Ignores -- CREATE TABLE fake and finds real_table."""
+        schema = tmp_path / "schema.sql"
+        schema.write_text(textwrap.dedent("""\
+            -- CREATE TABLE fake (x TEXT);
+            CREATE TABLE real_table (
+                id TEXT PRIMARY KEY
+            );
+        """))
+        with pytest.raises(ValueError, match="CREATE TABLE for fake not found"):
+            _get_table_create_sql("fake", schema)
+        sql = _get_table_create_sql("real_table", schema)
+        assert "real_table" in sql
+
+
+class TestFKDependenciesSqlparseEdgeCases:
+    """Edge-case tests for sqlparse-based _parse_fk_dependencies."""
+
+    def test_schema_qualified_references(self, tmp_path):
+        """Handles REFERENCES public.users(id) -> 'users' in deps."""
+        schema = tmp_path / "schema.sql"
+        schema.write_text(textwrap.dedent("""\
+            CREATE TABLE users (id TEXT PRIMARY KEY);
+            CREATE TABLE orders (
+                id TEXT PRIMARY KEY,
+                user_id TEXT REFERENCES public.users(id)
+            );
+        """))
+        deps = _parse_fk_dependencies(schema)
+        assert deps["orders"] == {"users"}
+        assert deps["users"] == set()
+
+    def test_schema_qualified_table_name(self, tmp_path):
+        """Handles CREATE TABLE public.orders with schema prefix."""
+        schema = tmp_path / "schema.sql"
+        schema.write_text(textwrap.dedent("""\
+            CREATE TABLE public.users (id TEXT PRIMARY KEY);
+            CREATE TABLE public.orders (
+                id TEXT PRIMARY KEY,
+                user_id TEXT REFERENCES users(id)
+            );
+        """))
+        deps = _parse_fk_dependencies(schema)
+        assert "orders" in deps
+        assert deps["orders"] == {"users"}
+
+    def test_commented_out_create_table_ignored(self, tmp_path):
+        """Ignores commented-out CREATE TABLE in FK dependency parsing."""
+        schema = tmp_path / "schema.sql"
+        schema.write_text(textwrap.dedent("""\
+            -- CREATE TABLE fake (id TEXT, ref_id TEXT REFERENCES other(id));
+            CREATE TABLE real_table (
+                id TEXT PRIMARY KEY
+            );
+        """))
+        deps = _parse_fk_dependencies(schema)
+        assert "fake" not in deps
+        assert "real_table" in deps
+        assert deps["real_table"] == set()
+
+
 class TestTopologicalSort:
     """Verify topological sort of tables by FK dependencies."""
 

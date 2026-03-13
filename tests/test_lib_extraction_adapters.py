@@ -127,18 +127,24 @@ class TestDatabaseClientProtocol:
         method = getattr(DatabaseClient, "close")
         assert inspect.iscoroutinefunction(method), "close must be async def"
 
-    def test_protocol_has_exactly_six_methods(self) -> None:
-        """Protocol defines exactly 6 methods: select, insert, update, delete, execute, close."""
+    def test_protocol_has_seven_methods(self) -> None:
+        """Protocol defines 7 methods: 6 async (select, insert, update, delete, execute, close) + 1 sync (transaction)."""
         tree = ast.parse(BASE_PATH.read_text())
         # Find the DatabaseClient class and extract method names
         for node in ast.iter_child_nodes(tree):
             if isinstance(node, ast.ClassDef) and node.name == "DatabaseClient":
-                method_names = [
+                async_methods = [
                     child.name
                     for child in ast.iter_child_nodes(node)
                     if isinstance(child, ast.AsyncFunctionDef)
                 ]
-                assert set(method_names) == {"select", "insert", "update", "delete", "execute", "close"}
+                sync_methods = [
+                    child.name
+                    for child in ast.iter_child_nodes(node)
+                    if isinstance(child, ast.FunctionDef)
+                ]
+                assert set(async_methods) == {"select", "insert", "update", "delete", "execute", "close"}
+                assert set(sync_methods) == {"transaction"}
                 return
         pytest.fail("DatabaseClient class not found in base.py")
 

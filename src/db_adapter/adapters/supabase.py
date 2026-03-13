@@ -19,6 +19,7 @@ Usage:
 """
 
 import asyncio
+from contextlib import AbstractAsyncContextManager
 from typing import Any
 
 from supabase import AsyncClient, acreate_client
@@ -65,6 +66,22 @@ class AsyncSupabaseAdapter:
                 if self._client is None:
                     self._client = await acreate_client(self._url, self._key)
         return self._client
+
+    # ------------------------------------------------------------------
+    # Transaction Support
+    # ------------------------------------------------------------------
+
+    def transaction(self) -> AbstractAsyncContextManager[None]:
+        """Enter a transaction.
+
+        Not supported by the Supabase client -- transactions require
+        direct PostgreSQL access.
+
+        Raises:
+            NotImplementedError: Always.  Use ``AsyncPostgresAdapter`` for
+                transaction support.
+        """
+        raise NotImplementedError("Transactions not supported for Supabase adapter.")
 
     # ------------------------------------------------------------------
     # CRUD Methods

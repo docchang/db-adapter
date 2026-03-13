@@ -1,0 +1,7 @@
+{
+    "items.b": "VARCHAR(100) NOT NULL",
+    "items.e": "BOOLEAN DEFAULT FALSE",
+    "items.f": "TIMESTAMP DEFAULT NOW()",
+    "products.price": "INTEGER DEFAULT 0",
+    "products.active": "BOOLEAN DEFAULT TRUE"
+}

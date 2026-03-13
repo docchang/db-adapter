@@ -50,6 +50,7 @@ Usage:
 from __future__ import annotations
 
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,32 @@ from pydantic import BaseModel, Field
 
 from db_adapter.adapters.base import DatabaseClient
 from db_adapter.backup.models import BackupSchema
+
+
+@asynccontextmanager
+async def _noop_transaction():
+    """No-op async context manager used when adapter lacks transaction support."""
+    yield
+
+
+def _get_transaction_ctx(adapter: DatabaseClient):
+    """Get a transaction context manager from the adapter, or a no-op fallback.
+
+    Safely handles adapters that:
+    - Don't have a ``transaction`` attribute at all
+    - Raise ``NotImplementedError`` from ``transaction()`` (e.g. Supabase)
+    - Return something that isn't an async context manager
+
+    Returns:
+        An async context manager (either the adapter's transaction or _noop_transaction).
+    """
+    try:
+        ctx = adapter.transaction()
+    except (AttributeError, NotImplementedError, TypeError):
+        return _noop_transaction()
+    if not hasattr(ctx, '__aenter__'):
+        return _noop_transaction()
+    return ctx
 
 
 class SyncResult(BaseModel):
@@ -514,6 +541,38 @@ async def _sync_direct(
             dest_profile, env_prefix
         )
 
+        async def _insert_rows(
+            adapter: DatabaseClient,
+            table: str,
+            source_rows: list[dict],
+            dest_slugs: set[str],
+            slug_field: str,
+            result: SyncResult,
+        ) -> None:
+            """Insert source rows whose slug is not in dest_slugs.
+
+            Updates ``result.synced_count`` and ``result.skipped_count``
+            in place. Raises ``ValueError`` on FK constraint violations.
+            """
+            for row in source_rows:
+                row_slug = row.get(slug_field)
+                if row_slug in dest_slugs:
+                    result.skipped_count += 1
+                    continue
+
+                try:
+                    await adapter.insert(table, data=row)
+                    result.synced_count += 1
+                except Exception as e:
+                    err_type = type(e).__name__
+                    if "ForeignKey" in err_type:
+                        raise ValueError(
+                            f"FK constraint violation inserting into "
+                            f"'{table}': {e}. Consider providing a "
+                            f"BackupSchema for FK-aware sync."
+                        ) from e
+                    raise
+
         for table in tables:
             # Get all rows from source
             source_rows = await source_adapter.select(
@@ -526,25 +585,14 @@ async def _sync_direct(
             )
             dest_slugs = {r[slug_field] for r in dest_slug_rows}
 
-            # Insert rows whose slug does not exist in dest
-            for row in source_rows:
-                row_slug = row.get(slug_field)
-                if row_slug in dest_slugs:
-                    result.skipped_count += 1
-                    continue
-
-                try:
-                    await dest_adapter.insert(table, data=row)
-                    result.synced_count += 1
-                except Exception as e:
-                    err_type = type(e).__name__
-                    if "ForeignKey" in err_type:
-                        raise ValueError(
-                            f"FK constraint violation inserting into "
-                            f"'{table}': {e}. Consider providing a "
-                            f"BackupSchema for FK-aware sync."
-                        ) from e
-                    raise
+            # Insert rows whose slug does not exist in dest;
+            # wrap per-table in a transaction when available.
+            ctx = _get_transaction_ctx(dest_adapter)
+            async with ctx:
+                await _insert_rows(
+                    dest_adapter, table, source_rows, dest_slugs,
+                    slug_field, result,
+                )
 
         result.success = True
 

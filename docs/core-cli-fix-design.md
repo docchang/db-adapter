@@ -54,7 +54,7 @@ SEVERITY: MEDIUM (test infrastructure)
 ├── #10 importlib.reload() breaks exception class identity [test_lib_extraction_exports.py + cli/__init__.py]
 ```
 
-> **Note**: Bug #6 (Backup CLI non-functional) moved to separate design: [core-backup-cli-design.md](core-backup-cli-design.md)
+> **Note**: Bug #6 (Backup CLI non-functional) moved to separate design: [core-cli-unify-design.md](core-cli-unify-design.md)
 
 **What works correctly (verified by 120 live integration tests — 104 passed, 16 xfailed):**
 - `SchemaIntrospector` — correctly introspects both databases, all 3 tables, FK constraints, column types (uses psycopg, not asyncpg)
@@ -243,7 +243,7 @@ Files: `src/db_adapter/cli/__init__.py` — `_async_sync()`
 
 ### 6. ~~Backup CLI~~ — Moved
 
-> Moved to separate design: [core-backup-cli-design.md](core-backup-cli-design.md)
+> Moved to separate design: [core-cli-unify-design.md](core-cli-unify-design.md)
 > Backup commands will be integrated as subcommands of the main `db-adapter` CLI.
 
 ---
@@ -345,7 +345,7 @@ Files: `tests/test_lib_extraction_exports.py` — `TestNoCircularImports`
 
 **Order**: #4 → #3 → #1 → #2 → #5 → #7 → #10 → docs → tests
 
-> Note: #6 moved to [core-backup-cli-design.md](core-backup-cli-design.md). #8 resolved by #1/#2/#7, #9 resolved by #3 — no separate sequence items needed.
+> Note: #6 moved to [core-cli-unify-design.md](core-cli-unify-design.md). #8 resolved by #1/#2/#7, #9 resolved by #3 — no separate sequence items needed.
 
 ### #4: Fix `connect_timeout` in AsyncPostgresAdapter
 
@@ -513,7 +513,7 @@ tests/test_live_integration.py
 ├── TestParseExpectedColumnsLive (5) — Case sensitivity bug demonstration
 ├── TestConfigLive (3)               — Config loading with real db.toml
 ├── TestSyncResultBug (2)            — .error vs .errors demonstration
-├── TestBackupCLIBugs (4)            — Backup CLI signature mismatches (fix in core-backup-cli)
+├── TestBackupCLIBugs (4)            — Backup CLI signature mismatches (fix in core-cli-unify)
 ├── TestAdapterEngineBug (2)         — connect_timeout bug (1 xfail)
 ├── TestLockFileLive (3)             — Lock file operations
 ├── TestFixPlanLive (2)              — Fix plan generation with real schema
@@ -528,7 +528,7 @@ tests/test_live_integration.py
 ├── TestAsyncSyncDirect (4)          — Direct _async_sync calls
 ├── TestCaseMismatchSeverity (2)     — Bug #3→#9 cascade demonstration
 ├── TestIntrospectorErrorPaths (6)   — RuntimeError paths, detailed introspection
-├── TestBackupCLIDeeper (3)          — Backup CLI signature analysis (fix in core-backup-cli)
+├── TestBackupCLIDeeper (3)          — Backup CLI signature analysis (fix in core-cli-unify)
 ├── TestSchemaModelEdgeCases (3)     — format_report branches, ConnectionResult
 └── TestFactoryEdgeCases (3)         — get_active_profile, ProfileNotFoundError
 ```
@@ -567,7 +567,7 @@ tests/test_live_integration.py
 
 ## Open Questions
 
-None — all questions resolved. Backup CLI moved to [core-backup-cli-design.md](core-backup-cli-design.md).
+None — all questions resolved. Backup CLI moved to [core-cli-unify-design.md](core-cli-unify-design.md).
 
 ---
 
@@ -579,7 +579,7 @@ None — all questions resolved. Backup CLI moved to [core-backup-cli-design.md]
 | `sync --user-id` required | Keep as-is (not a bug) | Underlying API requires user_id for filtering |
 | `connect_timeout` fix | Remove URL param, use connect_args or remove entirely | asyncpg doesn't recognize `connect_timeout` |
 | Case sensitivity | Lowercase in parser | PostgreSQL folds unquoted identifiers to lowercase; parser must match |
-| Backup CLI approach | Separate design doc | Moved to [core-backup-cli-design.md](core-backup-cli-design.md) — integrating as main CLI subcommands |
+| Backup CLI approach | Separate design doc | Moved to [core-cli-unify-design.md](core-cli-unify-design.md) — integrating as main CLI subcommands |
 | `get_adapter()` ignoring `provider` | Out of scope | Separate enhancement, not a post-extraction bug |
 | `importlib.reload()` test interaction | Workaround in live tests | Reload in export tests recreates `ProfileNotFoundError` class, breaking `except` in CLI. Detailed in [importlib-reload-class-identity.md](importlib-reload-class-identity.md) |
 
@@ -599,7 +599,7 @@ None — all questions resolved. Backup CLI moved to [core-backup-cli-design.md]
 - 120 tests across 32 test classes
 - 104 passing, 16 xfailed (all blocked by Bug #4)
 - Skip-if-no-DB guard: tests auto-skip if local databases aren't reachable
-- Tests document all 9 bugs with explicit assertions proving each bug exists (plus backup CLI bugs tracked in core-backup-cli)
+- Tests document all 9 bugs with explicit assertions proving each bug exists (plus backup CLI bugs tracked in core-cli-unify)
 - Direct CLI function calls (not subprocess) for coverage measurement
 
 **Known test interaction** — `importlib.reload()` class identity issue:

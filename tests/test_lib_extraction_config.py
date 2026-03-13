@@ -314,3 +314,311 @@ class TestLoaderModuleAttributes:
         assert classes == [], (
             f"Unexpected classes in loader.py: {classes}"
         )
+
+
+class TestDatabaseConfigNewFields:
+    """Verify new optional fields on DatabaseConfig for config-driven CLI defaults."""
+
+    def _minimal_profiles(self) -> dict[str, DatabaseProfile]:
+        """Return a minimal profiles dict for constructing DatabaseConfig."""
+        return {"dev": DatabaseProfile(url="postgresql://localhost/dev")}
+
+    def test_backward_compatible_no_new_fields(self) -> None:
+        """DatabaseConfig with only profiles (no new fields) still works."""
+        config = DatabaseConfig(profiles=self._minimal_profiles())
+
+        assert len(config.profiles) == 1
+        assert config.schema_file == "schema.sql"
+        assert config.validate_on_connect is True
+
+    def test_new_fields_default_to_none(self) -> None:
+        """All four new fields default to None when not provided."""
+        config = DatabaseConfig(profiles=self._minimal_profiles())
+
+        assert config.column_defs is None
+        assert config.backup_schema is None
+        assert config.sync_tables is None
+        assert config.user_id_env is None
+
+    def test_all_new_fields_populated(self) -> None:
+        """DatabaseConfig with all new fields set parses correctly."""
+        config = DatabaseConfig(
+            profiles=self._minimal_profiles(),
+            column_defs="defs.json",
+            backup_schema="bs.json",
+            sync_tables=["t1", "t2"],
+            user_id_env="DEV_USER_ID",
+        )
+
+        assert config.column_defs == "defs.json"
+        assert config.backup_schema == "bs.json"
+        assert config.sync_tables == ["t1", "t2"]
+        assert config.user_id_env == "DEV_USER_ID"
+
+    def test_column_defs_type(self) -> None:
+        """column_defs accepts a string and defaults to None."""
+        config_with = DatabaseConfig(
+            profiles=self._minimal_profiles(), column_defs="column-defs.json"
+        )
+        config_without = DatabaseConfig(profiles=self._minimal_profiles())
+
+        assert config_with.column_defs == "column-defs.json"
+        assert config_without.column_defs is None
+
+    def test_backup_schema_type(self) -> None:
+        """backup_schema accepts a string and defaults to None."""
+        config_with = DatabaseConfig(
+            profiles=self._minimal_profiles(), backup_schema="backup-schema.json"
+        )
+        config_without = DatabaseConfig(profiles=self._minimal_profiles())
+
+        assert config_with.backup_schema == "backup-schema.json"
+        assert config_without.backup_schema is None
+
+    def test_sync_tables_type(self) -> None:
+        """sync_tables accepts a list of strings and defaults to None."""
+        config_with = DatabaseConfig(
+            profiles=self._minimal_profiles(), sync_tables=["users", "orders", "items"]
+        )
+        config_without = DatabaseConfig(profiles=self._minimal_profiles())
+
+        assert config_with.sync_tables == ["users", "orders", "items"]
+        assert isinstance(config_with.sync_tables, list)
+        assert config_without.sync_tables is None
+
+    def test_user_id_env_type(self) -> None:
+        """user_id_env accepts a string and defaults to None."""
+        config_with = DatabaseConfig(
+            profiles=self._minimal_profiles(), user_id_env="MC_USER_ID"
+        )
+        config_without = DatabaseConfig(profiles=self._minimal_profiles())
+
+        assert config_with.user_id_env == "MC_USER_ID"
+        assert config_without.user_id_env is None
+
+    def test_sync_tables_empty_list(self) -> None:
+        """sync_tables accepts an empty list (distinct from None)."""
+        config = DatabaseConfig(profiles=self._minimal_profiles(), sync_tables=[])
+
+        assert config.sync_tables == []
+        assert config.sync_tables is not None
+
+    def test_new_fields_with_existing_schema_settings(self) -> None:
+        """New fields coexist with existing schema_file and validate_on_connect."""
+        config = DatabaseConfig(
+            profiles=self._minimal_profiles(),
+            schema_file="custom.sql",
+            validate_on_connect=False,
+            column_defs="defs.json",
+            backup_schema="bs.json",
+            sync_tables=["t1"],
+            user_id_env="USER_ID_VAR",
+        )
+
+        assert config.schema_file == "custom.sql"
+        assert config.validate_on_connect is False
+        assert config.column_defs == "defs.json"
+        assert config.backup_schema == "bs.json"
+        assert config.sync_tables == ["t1"]
+        assert config.user_id_env == "USER_ID_VAR"
+
+
+class TestLoadDbConfigNewSections:
+    """Test load_db_config() parsing of new [schema], [sync], and [defaults] sections."""
+
+    def test_all_new_sections_parsed(self, tmp_path: Path) -> None:
+        """TOML with all new sections returns DatabaseConfig with all new fields populated."""
+        toml_content = textwrap.dedent("""\
+            [profiles.dev]
+            url = "postgresql://localhost/dev"
+
+            [schema]
+            file = "schema.sql"
+            column_defs = "column-defs.json"
+            backup_schema = "backup-schema.json"
+
+            [sync]
+            tables = ["projects", "milestones", "tasks"]
+
+            [defaults]
+            user_id_env = "DEV_USER_ID"
+        """)
+        config_file = tmp_path / "db.toml"
+        config_file.write_text(toml_content)
+
+        config = load_db_config(config_path=config_file)
+
+        assert config.column_defs == "column-defs.json"
+        assert config.backup_schema == "backup-schema.json"
+        assert config.sync_tables == ["projects", "milestones", "tasks"]
+        assert config.user_id_env == "DEV_USER_ID"
+
+    def test_minimal_toml_new_fields_are_none(self, tmp_path: Path) -> None:
+        """TOML with only [profiles] returns DatabaseConfig with all new fields as None."""
+        toml_content = textwrap.dedent("""\
+            [profiles.local]
+            url = "postgresql://localhost/mydb"
+        """)
+        config_file = tmp_path / "db.toml"
+        config_file.write_text(toml_content)
+
+        config = load_db_config(config_path=config_file)
+
+        assert config.column_defs is None
+        assert config.backup_schema is None
+        assert config.sync_tables is None
+        assert config.user_id_env is None
+
+    def test_sync_section_only(self, tmp_path: Path) -> None:
+        """TOML with [sync] but no [defaults] parses sync_tables, user_id_env stays None."""
+        toml_content = textwrap.dedent("""\
+            [profiles.dev]
+            url = "postgresql://localhost/dev"
+
+            [sync]
+            tables = ["users", "orders"]
+        """)
+        config_file = tmp_path / "db.toml"
+        config_file.write_text(toml_content)
+
+        config = load_db_config(config_path=config_file)
+
+        assert config.sync_tables == ["users", "orders"]
+        assert config.user_id_env is None
+
+    def test_defaults_section_only(self, tmp_path: Path) -> None:
+        """TOML with [defaults] but no [sync] parses user_id_env, sync_tables stays None."""
+        toml_content = textwrap.dedent("""\
+            [profiles.dev]
+            url = "postgresql://localhost/dev"
+
+            [defaults]
+            user_id_env = "MY_USER_ID"
+        """)
+        config_file = tmp_path / "db.toml"
+        config_file.write_text(toml_content)
+
+        config = load_db_config(config_path=config_file)
+
+        assert config.sync_tables is None
+        assert config.user_id_env == "MY_USER_ID"
+
+    def test_schema_section_with_column_defs_only(self, tmp_path: Path) -> None:
+        """TOML with column_defs in [schema] but no backup_schema."""
+        toml_content = textwrap.dedent("""\
+            [profiles.dev]
+            url = "postgresql://localhost/dev"
+
+            [schema]
+            file = "schema.sql"
+            column_defs = "col-defs.json"
+        """)
+        config_file = tmp_path / "db.toml"
+        config_file.write_text(toml_content)
+
+        config = load_db_config(config_path=config_file)
+
+        assert config.column_defs == "col-defs.json"
+        assert config.backup_schema is None
+
+    def test_schema_section_with_backup_schema_only(self, tmp_path: Path) -> None:
+        """TOML with backup_schema in [schema] but no column_defs."""
+        toml_content = textwrap.dedent("""\
+            [profiles.dev]
+            url = "postgresql://localhost/dev"
+
+            [schema]
+            file = "schema.sql"
+            backup_schema = "bs.json"
+        """)
+        config_file = tmp_path / "db.toml"
+        config_file.write_text(toml_content)
+
+        config = load_db_config(config_path=config_file)
+
+        assert config.column_defs is None
+        assert config.backup_schema == "bs.json"
+
+    def test_sync_tables_is_list_type(self, tmp_path: Path) -> None:
+        """sync_tables field is list[str] when provided in TOML."""
+        toml_content = textwrap.dedent("""\
+            [profiles.dev]
+            url = "postgresql://localhost/dev"
+
+            [sync]
+            tables = ["t1", "t2", "t3"]
+        """)
+        config_file = tmp_path / "db.toml"
+        config_file.write_text(toml_content)
+
+        config = load_db_config(config_path=config_file)
+
+        assert isinstance(config.sync_tables, list)
+        assert len(config.sync_tables) == 3
+        assert all(isinstance(t, str) for t in config.sync_tables)
+
+    def test_existing_fields_unaffected_by_new_sections(self, tmp_path: Path) -> None:
+        """Existing schema_file and validate_on_connect still work alongside new fields."""
+        toml_content = textwrap.dedent("""\
+            [profiles.dev]
+            url = "postgresql://localhost/dev"
+            description = "Dev DB"
+
+            [schema]
+            file = "custom.sql"
+            validate_on_connect = false
+            column_defs = "defs.json"
+            backup_schema = "bs.json"
+
+            [sync]
+            tables = ["t1"]
+
+            [defaults]
+            user_id_env = "UID"
+        """)
+        config_file = tmp_path / "db.toml"
+        config_file.write_text(toml_content)
+
+        config = load_db_config(config_path=config_file)
+
+        # Existing fields
+        assert config.schema_file == "custom.sql"
+        assert config.validate_on_connect is False
+        assert len(config.profiles) == 1
+        assert config.profiles["dev"].description == "Dev DB"
+
+        # New fields
+        assert config.column_defs == "defs.json"
+        assert config.backup_schema == "bs.json"
+        assert config.sync_tables == ["t1"]
+        assert config.user_id_env == "UID"
+
+    def test_empty_sync_section(self, tmp_path: Path) -> None:
+        """TOML with empty [sync] section (no tables key) leaves sync_tables as None."""
+        toml_content = textwrap.dedent("""\
+            [profiles.dev]
+            url = "postgresql://localhost/dev"
+
+            [sync]
+        """)
+        config_file = tmp_path / "db.toml"
+        config_file.write_text(toml_content)
+
+        config = load_db_config(config_path=config_file)
+
+        assert config.sync_tables is None
+
+    def test_empty_defaults_section(self, tmp_path: Path) -> None:
+        """TOML with empty [defaults] section (no keys) leaves user_id_env as None."""
+        toml_content = textwrap.dedent("""\
+            [profiles.dev]
+            url = "postgresql://localhost/dev"
+
+            [defaults]
+        """)
+        config_file = tmp_path / "db.toml"
+        config_file.write_text(toml_content)
+
+        config = load_db_config(config_path=config_file)
+
+        assert config.user_id_env is None

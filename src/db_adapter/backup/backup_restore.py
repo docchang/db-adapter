@@ -34,13 +34,44 @@ Usage:
     report = validate_backup(path, schema)
 """
 
+from contextlib import asynccontextmanager
 from datetime import datetime
+import logging
 from pathlib import Path
 import json
 from typing import Any, Literal
 
+logger = logging.getLogger(__name__)
+
 from db_adapter.adapters.base import DatabaseClient
 from db_adapter.backup.models import BackupSchema, TableDef
+
+
+@asynccontextmanager
+async def _noop_transaction():
+    """No-op async context manager used when adapter lacks transaction support."""
+    yield
+
+
+def _get_transaction_ctx(adapter: "DatabaseClient"):
+    """Get a transaction context manager from the adapter, or a no-op fallback.
+
+    Safely handles adapters that:
+    - Don't have a ``transaction`` attribute at all
+    - Raise ``NotImplementedError`` from ``transaction()`` (e.g. Supabase)
+    - Return something that isn't an async context manager
+
+    Returns:
+        An async context manager (either the adapter's transaction or _noop_transaction).
+    """
+    try:
+        ctx = adapter.transaction()
+    except (AttributeError, NotImplementedError, TypeError):
+        return _noop_transaction()
+    # Verify result is an async context manager (has __aenter__)
+    if not hasattr(ctx, '__aenter__'):
+        return _noop_transaction()
+    return ctx
 
 
 async def backup_database(
@@ -213,19 +244,24 @@ async def restore_database(
     for table_def in schema.tables:
         id_maps[table_def.name] = {}
 
-    # Restore tables in schema order (parents first)
-    for table_def in schema.tables:
-        rows = backup_data.get(table_def.name, [])
-        await _restore_table(
-            adapter=adapter,
-            table_def=table_def,
-            rows=rows,
-            user_id=user_id,
-            mode=mode,
-            dry_run=dry_run,
-            id_maps=id_maps,
-            summary=summary,
-        )
+    # Restore tables in schema order (parents first).
+    # Wrap entire multi-table loop in a transaction when available.
+    # All tables share one transaction because FK remapping across
+    # tables requires atomicity (child inserts depend on parent id_maps).
+    ctx = _get_transaction_ctx(adapter)
+    async with ctx:
+        for table_def in schema.tables:
+            rows = backup_data.get(table_def.name, [])
+            await _restore_table(
+                adapter=adapter,
+                table_def=table_def,
+                rows=rows,
+                user_id=user_id,
+                mode=mode,
+                dry_run=dry_run,
+                id_maps=id_maps,
+                summary=summary,
+            )
 
     return summary
 
@@ -255,11 +291,11 @@ async def _restore_table(
     table_name = table_def.name
     table_summary = summary[table_name]
 
-    for row in rows:
-        try:
-            # Save original PK for mapping
-            old_pk = row[table_def.pk]
+    for i, row in enumerate(rows):
+        # Save original PK for mapping (safe access before try block)
+        old_pk = row.get(table_def.pk, "<unknown>")
 
+        try:
             # Override user_id with current user
             if table_def.user_field:
                 row[table_def.user_field] = user_id
@@ -344,8 +380,15 @@ async def _restore_table(
         except ValueError:
             # Re-raise ValueError (mode=fail) without catching
             raise
-        except Exception:
+        except Exception as e:
             table_summary["failed"] += 1
+            table_summary.setdefault("failure_details", []).append(
+                {"row_index": i, "old_pk": old_pk, "error": f"{type(e).__name__}: {e}"}
+            )
+            logger.warning(
+                "Restore failed for %s row %d (pk=%s): %s",
+                table_name, i, old_pk, e,
+            )
 
 
 def validate_backup(backup_path: str, schema: BackupSchema) -> dict:
